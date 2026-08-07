@@ -9,7 +9,7 @@ pub struct RunRequest {
     pub code: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RunResponse {
     pub stdout: String,
     pub stderr: String,
