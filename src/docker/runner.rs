@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::docker::exec::ExecResult;
 use crate::docker::image::pull_if_needed;
 use crate::docker::workspace::{create_workspace, write_source};
+use crate::models::{RunResponse, RunStatus};
 use crate::workspace::Workspace;
 use anyhow::Result;
 use bollard::container::LogOutput;
@@ -13,12 +14,15 @@ use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::HostConfig;
 use bollard::query_parameters::{
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::{
     Docker, models::ContainerCreateBody, query_parameters::CreateContainerOptionsBuilder,
 };
 use futures_util::StreamExt;
 use serde::Serialize;
+use std::time::Duration;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -26,12 +30,12 @@ pub struct DockerRunner {
     docker: Arc<Docker>,
 }
 
-#[derive(Serialize, Debug)]
-pub struct RunResponse {
-    stdout: String,
-    stderr: String,
-    exit_code: i64,
-}
+// #[derive(Serialize, Debug)]
+// pub struct RunResponse {
+//     stdout: String,
+//     stderr: String,
+//     exit_code: i64,
+// }
 impl DockerRunner {
     pub fn new(docker: Arc<Docker>) -> Self {
         Self { docker }
@@ -93,7 +97,7 @@ impl DockerRunner {
     pub async fn run_rust(&self, code: &str) -> anyhow::Result<RunResponse> {
         let workspace = Workspace::new()?;
         workspace.write("main.rs", code)?;
-        self.with_container("rust:1.89",workspace.path(),|id|async move{
+        self.with_container("rust:1.89", workspace.path(), |id| async move {
             let compile = self
                 .exec(
                     &id,
@@ -105,51 +109,47 @@ impl DockerRunner {
                     ],
                 )
                 .await?;
-            let result = if compile.exit_code != 0 {
-                RunResponse {
+            if compile.exit_code != 0 {
+                return Ok(RunResponse {
+                    status: RunStatus::CompileError,
                     stdout: String::new(),
                     stderr: compile.stderr,
                     exit_code: compile.exit_code,
-                }
-            } else {
-                let res = self.exec(&id, vec!["/workspace/main".into()]).await?;
-                RunResponse {
-                    stdout: res.stdout,
-                    stderr: res.stderr,
-                    exit_code: res.exit_code,
+                });
+            }
+            let res = timeout(
+                Duration::from_secs(2),
+                self.exec(&id, vec!["/workspace/main".into()]),
+            )
+            .await;
+            let res = match res {
+                Ok(result) => result?,
+                Err(_) => {
+                    if let Err(err) = self.stop(id.as_str()).await {
+                        tracing::warn!(container_id = %id,
+                        error = %err,
+                        "failed to stop timed out container")
+                    }
+                    return Ok(RunResponse {
+                        status: RunStatus::TimeLimitExceeded,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: -1,
+                    });
                 }
             };
-            Ok(result)
-        }).await
-        // let id = self.create("rust:1.89", workspace.path()).await?;
-        // self.start(id.as_str()).await?;
-        // let compile = self
-        //     .exec(
-        //         &id,
-        //         vec![
-        //             "rustc".into(),
-        //             "/workspace/main.rs".into(),
-        //             "-o".into(),
-        //             "/workspace/main".into(),
-        //         ],
-        //     )
-        //     .await?;
-        // let result = if compile.exit_code != 0 {
-        //     RunResponse {
-        //         stdout: String::new(),
-        //         stderr: compile.stderr,
-        //         exit_code: compile.exit_code,
-        //     }
-        // } else {
-        //     let res = self.exec(&id, vec!["/workspace/main".into()]).await?;
-        //     RunResponse {
-        //         stdout: res.stdout,
-        //         stderr: res.stderr,
-        //         exit_code: res.exit_code,
-        //     }
-        // };
-        // self.remove(&id).await?;
-        // Ok(result)
+            Ok(RunResponse {
+                status: if res.exit_code == 0 {
+                    RunStatus::Accepted
+                } else {
+                    RunStatus::RuntimeError
+                },
+                stdout: res.stdout,
+                stderr: res.stderr,
+                exit_code: res.exit_code,
+            })
+        })
+        .await
     }
 
     async fn cleanup_container(&self, id: &str) -> Result<()> {
@@ -165,12 +165,25 @@ impl DockerRunner {
         let id = self.create(image, workspace).await?;
         self.start(id.as_str()).await?;
         let result = f(id.clone()).await;
-        if let Err(e)=self.cleanup_container(id.as_str()).await{
+        if let Err(e) = self.cleanup_container(id.as_str()).await {
             tracing::warn!(container_id = %id,
                 error = %e,
                 "failed to remove container")
         }
         result
+    }
+
+    pub async fn stop(&self, id: &str) -> Result<()> {
+        self.docker
+            .stop_container(
+                id,
+                Some(StopContainerOptions {
+                    signal: None,
+                    t: Some(1),
+                }),
+            )
+            .await?;
+        Ok(())
     }
 }
 mod test {
@@ -181,7 +194,7 @@ mod test {
         let runner = DockerRunner::new(Arc::new(docker));
         let code = r#"
         fn main() {
-            println!("Hello, Runner!");
+             panic!("oops");
         }
         "#;
 
