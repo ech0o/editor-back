@@ -5,6 +5,8 @@ mod routes;
 mod models;
 mod state;
 mod workspace;
+mod apierror;
+mod error;
 
 use tokio::net::TcpListener;
 
@@ -15,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let app = app::create_app().await?;
 
     let listener = TcpListener::bind("0.0.0.0:4000").await?;
+    tracing::info!("Listening on http://0.0.0.0:4000");
 
     axum::serve(listener, app).await?;
 
