@@ -1,12 +1,14 @@
+use crate::apierror::ApiError;
 use crate::docker::exec::ExecResult;
-use crate::models::RunResponse;
 use crate::docker::workspace::{create_workspace, write_source};
+use crate::models::{RunRequest, RunResponse};
 use crate::state::AppState;
 use axum::error_handling::HandleError;
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router, extract::State, routing::get};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub fn router() -> Router<AppState> {
@@ -15,7 +17,7 @@ pub fn router() -> Router<AppState> {
         // .route("/container", post(create_container))
         // .route("/exec", get(exec))
         .route("/mount", get(workspace))
-        .route("/code",get(code_test))
+        .route("/run", post(run_handle))
 }
 
 async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -34,6 +36,11 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 struct CreateResponse {
     id: String,
 }
+
+// #[derive(Debug, Deserialize,Serialize)]
+// pub struct RunRequest {
+//     pub code: String,
+// }
 
 // async fn create_container(
 //     State(state): State<AppState>,
@@ -81,12 +88,28 @@ async fn workspace(State(state): State<AppState>) -> Json<ExecResult> {
     Json(res.unwrap())
 }
 
-async fn code_test(State(state): State<AppState>) -> Json<RunResponse> {
-    let code = r#"
-        fn main() {
-            println!("Hello, Runner!");
+async fn run_handle(
+    State(state): State<AppState>,
+    results: Result<Json<RunRequest>, JsonRejection>,
+) -> Result<Json<RunResponse>, ApiError> {
+    let Json(request) = results.map_err(|err| match err.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            tracing::error!(
+                error=%err,
+                "Invalid JSON request"
+            );
+            ApiError::PayloadTooLarge
         }
-        "#;
-    let ret = state.runner.run_rust(code).await.unwrap();
-    Json(ret)
+        _ => {
+            println!("{}", err.status());
+            tracing::error!(
+                error=%err,
+                "Invalid JSON request"
+            );
+            ApiError::InvalidJson
+        }
+    })?;
+    tracing::debug!("received request: {:?}", request);
+    let response = state.runner.run_rust(&request.code).await?;
+    Ok(Json(response))
 }
