@@ -3,15 +3,15 @@ use std::fs::remove_dir_all;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::docker::exec::ExecResult;
 use crate::docker::image::pull_if_needed;
 use crate::docker::workspace::{create_workspace, write_source};
-use crate::models::{RunResponse, RunStatus};
+use crate::models::{ExecResult, RunResponse, RunStatus};
 use crate::workspace::Workspace;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use bollard::config::MountType;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::HostConfig;
+use bollard::models::{ContainerInspectResponse, HostConfig, Mount};
 use bollard::query_parameters::{
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     StopContainerOptions,
@@ -24,6 +24,9 @@ use serde::Serialize;
 use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
+const RUN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct DockerRunner {
@@ -54,6 +57,18 @@ impl DockerRunner {
 
         let host_config = HostConfig {
             binds: Some(vec![format!("{}:/workspace", workspace.to_string_lossy())]),
+            memory: Some(128 * 1024 * 1024),
+            memory_swap: Some(128 * 1024 * 1024),
+            nano_cpus: Some(500_000_000),
+            network_mode: Some(String::from("none")),
+            pids_limit: Some(64),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            readonly_rootfs: Some(true),
+            mounts: Some(vec![Mount {
+                target: Some("/tmp".to_string()),
+                typ: Some(MountType::TMPFS),
+                ..Default::default()
+            }]),
             ..Default::default()
         };
 
@@ -98,8 +113,9 @@ impl DockerRunner {
         let workspace = Workspace::new()?;
         workspace.write("main.rs", code)?;
         self.with_container("rust:1.89", workspace.path(), |id| async move {
-            let compile = self
-                .exec(
+            let compile = tokio::time::timeout(
+                COMPILE_TIMEOUT,
+                self.exec(
                     &id,
                     vec![
                         "rustc".into(),
@@ -107,47 +123,89 @@ impl DockerRunner {
                         "-o".into(),
                         "/workspace/main".into(),
                     ],
-                )
-                .await?;
-            if compile.exit_code != 0 {
+                ),
+            )
+            .await;
+            let compile = match compile {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.stop(&id).await?;
+                    return Ok(RunResponse {
+                        stdout: String::new(),
+                        status: RunStatus::TimeLimitExceeded,
+                        stderr: "compilation timed out".to_string(),
+                        exit_code: -1,
+                    });
+                }
+            };
+            let container = self.inspect_container(id.as_str()).await?;
+
+            let state = container
+                .state
+                .ok_or_else(|| anyhow!("container state is missing"))?;
+
+            if state.oom_killed.unwrap_or(false) {
+                return Ok(RunResponse {
+                    status: RunStatus::MemoryLimitExceeded,
+                    stdout: compile.stdout,
+                    stderr: compile.stderr,
+                    exit_code: compile.exit_code.unwrap_or(-1),
+                });
+            }
+            if compile.exit_code.unwrap() != 0 {
                 return Ok(RunResponse {
                     status: RunStatus::CompileError,
                     stdout: String::new(),
                     stderr: compile.stderr,
-                    exit_code: compile.exit_code,
+                    exit_code: compile.exit_code.unwrap_or(-1),
                 });
             }
             let res = timeout(
-                Duration::from_secs(2),
+                RUN_TIMEOUT,
                 self.exec(&id, vec!["/workspace/main".into()]),
             )
             .await;
-            let res = match res {
-                Ok(result) => result?,
+            match res {
+                Ok(result) => {
+                    let result = result?;
+                    let container = self.inspect_container(id.as_str()).await?;
+                    let state = container
+                        .state
+                        .ok_or_else(|| anyhow::anyhow!("container state is missing"))?;
+                    if state.oom_killed.unwrap_or(false) {
+                        return Ok(RunResponse {
+                            stdout: result.stdout,
+                            status: RunStatus::MemoryLimitExceeded,
+                            stderr: result.stderr,
+                            exit_code: result.exit_code.unwrap_or(-1),
+                        });
+                    }
+                    let status = if result.exit_code.unwrap() == 0 {
+                        RunStatus::Accepted
+                    } else {
+                        RunStatus::RuntimeError
+                    };
+                    Ok(RunResponse {
+                        stdout: result.stdout,
+                        status,
+                        stderr: result.stderr,
+                        exit_code: result.exit_code.unwrap_or(-1),
+                    })
+                }
                 Err(_) => {
                     if let Err(err) = self.stop(id.as_str()).await {
                         tracing::warn!(container_id = %id,
                         error = %err,
                         "failed to stop timed out container")
                     }
-                    return Ok(RunResponse {
+                    Ok(RunResponse {
                         status: RunStatus::TimeLimitExceeded,
                         stdout: String::new(),
                         stderr: String::new(),
                         exit_code: -1,
-                    });
+                    })
                 }
-            };
-            Ok(RunResponse {
-                status: if res.exit_code == 0 {
-                    RunStatus::Accepted
-                } else {
-                    RunStatus::RuntimeError
-                },
-                stdout: res.stdout,
-                stderr: res.stderr,
-                exit_code: res.exit_code,
-            })
+            }
         })
         .await
     }
@@ -185,22 +243,149 @@ impl DockerRunner {
             .await?;
         Ok(())
     }
+
+    pub async fn inspect_container(&self, container_id: &str) -> Result<ContainerInspectResponse> {
+        Ok(self.docker.inspect_container(container_id, None).await?)
+    }
 }
 mod test {
     use super::*;
+
+    async fn runner() -> DockerRunner {
+        let docker = Docker::connect_with_local_defaults().unwrap();
+        DockerRunner::new(Arc::new(docker))
+    }
     #[tokio::test]
     async fn test_run() -> anyhow::Result<()> {
-        let docker = Docker::connect_with_local_defaults()?;
-        let runner = DockerRunner::new(Arc::new(docker));
+        let runner = runner().await;
         let code = r#"
-        fn main() {
-             panic!("oops");
-        }
-        "#;
+              use std::fs;
+
+fn main() {
+    fs::write("/workspace/test.txt", "hello").unwrap();
+    println!("ok");
+}
+                "#;
 
         let result = runner.run_rust(code).await?;
-
+        // assert!(matches!(result.status, RunStatus::Accepted));
+        // assert_eq!(result.exit_code, 0);
+        // assert_eq!(result.stdout.trim(), "hello");
         println!("{:#?}", result);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_compile_error() {
+        let runner = runner().await;
+
+        let result = runner
+            .run_rust(
+                r#"
+            fn main() {
+                let x: i32 = "not an integer";
+                println!("{}", x);
+            }
+            "#,
+            )
+            .await
+            .expect("run_rust failed");
+
+        assert!(matches!(result.status, RunStatus::CompileError));
+
+        assert_ne!(result.exit_code, 0);
+        assert!(!result.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_timeout() {
+        let runner = runner().await;
+
+        let result = runner
+            .run_rust(
+                r#"
+            fn main() {
+                loop {}
+            }
+            "#,
+            )
+            .await
+            .expect("run_rust failed");
+
+        assert!(matches!(result.status, RunStatus::TimeLimitExceeded));
+    }
+
+    #[tokio::test]
+    async fn run_memory_limit() {
+        let runner = runner().await;
+
+        let result = runner
+            .run_rust(
+                r#"
+            fn main() {
+                let mut data = Vec::new();
+
+                loop {
+                    data.push(vec![0u8; 1024 * 1024]);
+                }
+            }
+            "#,
+            )
+            .await
+            .expect("run_rust failed");
+        println!("{:?}", result.status);
+        assert!(matches!(result.status, RunStatus::MemoryLimitExceeded));
+    }
+    #[tokio::test]
+    async fn capture_stdout_and_stderr() {
+        let runner = runner().await;
+
+        let result = runner
+            .run_rust(
+                r#"
+            use std::fs;
+
+fn main() {
+    fs::write("/tmp/test.txt", "hello").unwrap();
+    println!("ok");
+}
+            "#,
+            )
+            .await
+            .expect("run_rust failed");
+
+        assert!(matches!(result.status, RunStatus::Accepted));
+
+        assert!(result.stdout.contains("stdout"));
+        assert!(result.stderr.contains("stderr"));
+    }
+
+    #[tokio::test]
+    async fn parallel_test() {
+        let code_a = r#"
+        fn main() {
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("A");
+    }"#;
+        let code_b = r#"
+        fn main() {
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("B");
+    }"#;
+        let runner = runner().await;
+        let runner_a=runner.run_rust(code_a);
+        let runner_b = runner.run_rust(code_b);
+        let (a,b)=tokio::join!(runner_a,runner_b);
+        match (a,b){
+            (Ok(a), Ok(b)) =>{
+                println!("a:{:?} b:{:?}",a,b);
+            },
+            (Err(a), Err(b)) =>{
+                println!("err:a:{:?} err:b:{:?}",a,b);
+            },
+            (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+                println!("err");
+            }
+        }
     }
 }
