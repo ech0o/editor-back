@@ -9,6 +9,7 @@ pub enum ApiError {
     Internal(anyhow::Error),
     InvalidJson,
     PayloadTooLarge,
+    TooManyRequests,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,8 +43,16 @@ impl IntoResponse for ApiError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(ErrorResponse {
                     error: String::from("payload_too_large"),
-                })
-                ).into_response(),
+                }),
+            )
+                .into_response(),
+            ApiError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: String::from("too_many_requests"),
+                }),
+            )
+                .into_response(),
         }
     }
 }
