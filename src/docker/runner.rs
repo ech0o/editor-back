@@ -160,11 +160,7 @@ impl DockerRunner {
                     exit_code: compile.exit_code.unwrap_or(-1),
                 });
             }
-            let res = timeout(
-                RUN_TIMEOUT,
-                self.exec(&id, vec!["/workspace/main".into()]),
-            )
-            .await;
+            let res = timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspace/main".into()])).await;
             match res {
                 Ok(result) => {
                     let result = result?;
@@ -221,13 +217,17 @@ impl DockerRunner {
         Fut: Future<Output = anyhow::Result<T>>,
     {
         let id = self.create(image, workspace).await?;
-        self.start(id.as_str()).await?;
-        let result = f(id.clone()).await;
-        if let Err(e) = self.cleanup_container(id.as_str()).await {
-            tracing::warn!(container_id = %id,
-                error = %e,
-                "failed to remove container")
-        }
+        let result = match self.start(id.as_str()).await {
+            Ok(()) => f(id.clone()).await,
+            Err(err) => Err(err),
+        };
+        // let result = f(id.clone()).await;
+        // if let Err(e) = self.cleanup_container(id.as_str()).await {
+        //     tracing::warn!(container_id = %id,
+        //         error = %e,
+        //         "failed to remove container")
+        // }
+        self.clean_up(id.as_str()).await;
         result
     }
 
@@ -246,6 +246,15 @@ impl DockerRunner {
 
     pub async fn inspect_container(&self, container_id: &str) -> Result<ContainerInspectResponse> {
         Ok(self.docker.inspect_container(container_id, None).await?)
+    }
+
+    async fn clean_up(&self, id: &str) {
+        if let Err(err) = self.stop(id).await {
+            tracing::error!(container_id = %id,err=%err, "failed to stop container");
+        }
+        if let Err(err) = self.cleanup_container(id).await {
+            tracing::error!(container_id = %id,err=%err, "failed to cleanup container");
+        }
     }
 }
 mod test {
@@ -373,16 +382,16 @@ fn main() {
     println!("B");
     }"#;
         let runner = runner().await;
-        let runner_a=runner.run_rust(code_a);
+        let runner_a = runner.run_rust(code_a);
         let runner_b = runner.run_rust(code_b);
-        let (a,b)=tokio::join!(runner_a,runner_b);
-        match (a,b){
-            (Ok(a), Ok(b)) =>{
-                println!("a:{:?} b:{:?}",a,b);
-            },
-            (Err(a), Err(b)) =>{
-                println!("err:a:{:?} err:b:{:?}",a,b);
-            },
+        let (a, b) = tokio::join!(runner_a, runner_b);
+        match (a, b) {
+            (Ok(a), Ok(b)) => {
+                println!("a:{:?} b:{:?}", a, b);
+            }
+            (Err(a), Err(b)) => {
+                println!("err:a:{:?} err:b:{:?}", a, b);
+            }
             (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
                 println!("err");
             }
