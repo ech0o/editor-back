@@ -92,6 +92,12 @@ async fn run_handle(
     State(state): State<AppState>,
     results: Result<Json<RunRequest>, JsonRejection>,
 ) -> Result<Json<RunResponse>, ApiError> {
+    let _permit = match state.semaphore.try_acquire(){
+        Ok(permit) => permit,
+        Err(_)=>{
+            return Err(ApiError::TooManyRequests)
+        }
+    };
     let Json(request) = results.map_err(|err| match err.status() {
         StatusCode::PAYLOAD_TOO_LARGE => {
             tracing::error!(
