@@ -10,6 +10,8 @@ pub enum ApiError {
     InvalidJson,
     PayloadTooLarge,
     TooManyRequests,
+    QueueClosed,
+    JobNotFound,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +55,20 @@ impl IntoResponse for ApiError {
                 }),
             )
                 .into_response(),
+            ApiError::QueueClosed => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: String::from("QueueClosed"),
+                }),
+                ).into_response(),
+            ApiError::JobNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(
+                    ErrorResponse {
+                        error: String::from("JobNotFound"),
+                    }
+                )
+                ).into_response()
         }
     }
 }
