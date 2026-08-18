@@ -110,3 +110,12 @@ impl From<Job> for JobResponse {
 pub struct JobMessage{
     pub job_id: Uuid,
 }
+
+#[derive(Debug,Serialize,Deserialize)]
+pub struct DlqMessage{
+    pub original_payload:Vec<u8>,
+    pub error:String,
+    pub topic:String,
+    pub partition:i32,
+    pub offset:i64,
+}
