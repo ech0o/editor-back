@@ -46,8 +46,8 @@ CREATE TABLE IF NOT EXISTS jobs (
         )
     "#,
         )
-            .execute(&self.pool)
-            .await?;
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -60,15 +60,15 @@ INSERT INTO jobs (id, language, code,status,stdout,
 VALUES (?,?,?,?,?,?,?)
 "#,
         )
-            .bind(job.id.to_string())
-            .bind("rust")
-            .bind(&job.code)
-            .bind(job.status.to_string())
-            .bind(&job.stdout)
-            .bind(&job.stderr)
-            .bind(job.exit_code)
-            .execute(&self.pool)
-            .await?;
+        .bind(job.id.to_string())
+        .bind("rust")
+        .bind(&job.code)
+        .bind(job.status.to_string())
+        .bind(&job.stdout)
+        .bind(&job.stderr)
+        .bind(job.exit_code)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -85,6 +85,20 @@ VALUES (?,?,?,?,?,?,?)
     //     }
     // }
     //
+
+    pub async fn try_start(&self, id: Uuid) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            r#"
+UPDATE jobs SET status = 'Running' 
+            WHERE id = $1
+            AND status = 'Queued'
+"#,
+        )
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
     pub async fn get(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
         let row = sqlx::query(
             r#"
@@ -100,20 +114,20 @@ VALUES (?,?,?,?,?,?,?)
         WHERE id = ?
         "#,
         )
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(row) = row else {
             return Ok(None);
         };
         let mut job = Job {
-            id: Uuid::try_parse(&row.try_get::<String,_>("id")?.as_str())?,
+            id: Uuid::try_parse(&row.try_get::<String, _>("id")?.as_str())?,
             language: row.try_get("language")?,
             code: row.try_get("code")?,
             status: RunStatus::Queued,
             stdout: row.try_get("stdout")?,
             stderr: row.try_get("stderr")?,
-            exit_code:row.try_get("exit_code")?,
+            exit_code: row.try_get("exit_code")?,
         };
         let status = match row.try_get("status")? {
             "Accepted" => RunStatus::Accepted,
@@ -123,7 +137,7 @@ VALUES (?,?,?,?,?,?,?)
             "CompileError" => RunStatus::CompileError,
             "RuntimeError" => RunStatus::RuntimeError,
             "TimeLimitExceeded" => RunStatus::TimeLimitExceeded,
-            "MemoryLimitExceeded"=> RunStatus::MemoryLimitExceeded,
+            "MemoryLimitExceeded" => RunStatus::MemoryLimitExceeded,
             status => anyhow::bail!("unknown run status: {status}"),
         };
         job.status = status;
@@ -134,12 +148,13 @@ VALUES (?,?,?,?,?,?,?)
         let result = sqlx::query(
             r#"
 UPDATE jobs
-SET status = ? WHERE id = ?"#
-        ).bind(status.to_string())
-            .bind(id.to_string())
-            .execute(&self.pool)
-            .await?;
-
+SET status = ? WHERE id = ?"#,
+        )
+        .bind(status.to_string())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        tracing::info!(result = ?result, "updating job status");
         if result.rows_affected() == 0 {
             anyhow::bail!("job not found: {id}");
         }
@@ -165,14 +180,14 @@ SET status = ? WHERE id = ?"#
         WHERE id = ?
         "#,
         )
-            .bind(status.to_string())
-            .bind(stdout)
-            .bind(stderr)
-            .bind(exit_code)
-            .bind(id.to_string())
-            .execute(&self.pool)
-            .await?;
-
+        .bind(status.to_string())
+        .bind(stdout)
+        .bind(stderr)
+        .bind(exit_code)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        tracing::info!(result = ?result,status=?status, "finish job status");
         if result.rows_affected() == 0 {
             anyhow::bail!("job not found: {id}");
         }
