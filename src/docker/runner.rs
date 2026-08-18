@@ -181,7 +181,7 @@ impl DockerRunner {
                         });
                     }
                     let status = if result.exit_code.unwrap() == 0 {
-                        RunStatus::Accepted
+                        RunStatus::Success
                     } else {
                         RunStatus::RuntimeError
                     };
