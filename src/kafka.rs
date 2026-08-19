@@ -10,6 +10,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct KafkaProducer {
@@ -84,19 +85,37 @@ impl KafkaConsumer {
             .map_err(|err| ProcessError::Permanent(anyhow!("invalid job message: {err}")))?;
         let job = self
             .jobs
-            .get(job_msg.job_id)
+            .get_and_queued(job_msg.job_id)
             .await
             .map_err(ProcessError::Retryable)?
             .ok_or_else(|| ProcessError::Permanent(anyhow!("job {} not found", job_msg.job_id)))?;
-        let started = self
+        let lock_token = self
             .jobs
             .try_start(job.id)
             .await
             .map_err(ProcessError::Retryable)?;
-        if !started {
-            tracing::error!("job already started");
+        let Some(lock_token) = lock_token else {
             return Ok(());
-        }
+        };
+        let jobs = self.jobs.clone();
+        let job_id = job.id;
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                match jobs.heartbeat(job_id, lock_token).await {
+                    Ok(true) => {
+                        tracing::debug!(job_id=%job_id,"job lease renewed");
+                    }
+                    Ok(false) => {
+                        tracing::warn!(job_id=%job_id,"job lease lost");
+                    }
+                    Err(err) => {
+                        tracing::error!(job_id=%job_id,"job heard unrecoverable error: {}", err);
+                    }
+                }
+            }
+        });
         tracing::info!(job=%job.id,"job started");
         self.jobs
             .update_status(job.id, RunStatus::Running)
@@ -105,6 +124,7 @@ impl KafkaConsumer {
         let result = match job.language.as_str() {
             "rust" => self.runner.run_rust(job.id, &job.code).await,
             _ => {
+                heartbeat.abort();
                 self.jobs
                     .finish(
                         job.id,
@@ -112,6 +132,7 @@ impl KafkaConsumer {
                         None,
                         Some(format!("unsupported lang:{}", job.language)),
                         None,
+                        lock_token,
                     )
                     .await
                     .map_err(ProcessError::Retryable)?;
@@ -121,6 +142,7 @@ impl KafkaConsumer {
                 )));
             }
         };
+        heartbeat.abort();
         match result {
             Ok(res) => {
                 self.jobs
@@ -130,6 +152,7 @@ impl KafkaConsumer {
                         Some(res.stdout),
                         Some(res.stderr),
                         Some(res.exit_code),
+                        lock_token,
                     )
                     .await
                     .map_err(ProcessError::Retryable)?;
@@ -142,6 +165,7 @@ impl KafkaConsumer {
                         None,
                         Some(err.to_string()),
                         None,
+                        lock_token,
                     )
                     .await
                     .map_err(ProcessError::Retryable)?;
@@ -151,38 +175,52 @@ impl KafkaConsumer {
     }
     pub async fn run(&self) -> anyhow::Result<()> {
         let mut stream = self.consumer.stream();
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(message) => match self.handle_message(&message).await {
-                    Ok(()) => {
-                        self.consumer
-                            .commit_message(&message, CommitMode::Async)
-                            .map_err(|err| anyhow!("Kafka commit failed: {err}"))?;
+        loop {
+            tokio::select! {
+                message = stream.next() => {
+                    let Some(message) = message else{
+                        break;
+                    };
+                    match message {
+                        Ok(message) => match self.handle_message(&message).await {
+                            Ok(()) => {
+                                self.consumer
+                                    .commit_message(&message, CommitMode::Async)
+                                    .map_err(|err| anyhow!("Kafka commit failed: {err}"))?;
+                            }
+                            Err(err @ ProcessError::Permanent(_)) => {
+                                tracing::error!(
+                                    error = %err,
+                                    topic = message.topic(),
+                                    partition = message.partition(),
+                                    offset = message.offset(),
+                                    "permanent Kafka message error");
+                                self.send_to_dlq(&message,&err).await?;
+                                self.consumer
+                                    .commit_message(&message, CommitMode::Async)
+                                    .map_err(|err| anyhow!("Kafka commit failed: {err}"))?;
+                            }
+                            Err(ProcessError::Retryable(err)) => {
+                                tracing::error!(
+                                    error = %err,
+                                    "retryable Kafka message error"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::debug!(error=%err,"error receiving message: {:?}", err);
+                        }
                     }
-                    Err(err @ ProcessError::Permanent(_)) => {
-                        tracing::error!(
-                            error = %err,
-                            topic = message.topic(),
-                            partition = message.partition(),
-                            offset = message.offset(),
-                            "permanent Kafka message error");
-                        self.send_to_dlq(&message,&err).await?;
-                        self.consumer
-                            .commit_message(&message, CommitMode::Async)
-                            .map_err(|err| anyhow!("Kafka commit failed: {err}"))?;
-                    }
-                    Err(ProcessError::Retryable(err)) => {
-                        tracing::error!(
-                            error = %err,
-                            "retryable Kafka message error"
-                        );
-                    }
-                },
-                Err(err) => {
-                    tracing::debug!(error=%err,"error receiving message: {:?}", err);
+                }
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    tracing::info!("shutdown signal received");
+                    break;
                 }
             }
         }
+        tracing::info!("consumer stopped");
+
         Ok(())
     }
 
