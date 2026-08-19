@@ -15,6 +15,8 @@ use axum::{
 use bollard::Docker;
 use std::collections::HashMap;
 use std::sync::Arc;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
@@ -23,16 +25,20 @@ use tower_http::limit::RequestBodyLimitLayer;
 pub async fn create_app() -> anyhow::Result<Router> {
     let docker = Docker::connect_with_local_defaults()?;
     let runner = DockerRunner::new(Arc::new(docker));
-    let db = Database::new("sqlite://judge.db").await?;
+    let db = PgPool::connect("postgres://postgres:example@localhost:5432/postgres").await?;
     let kafka = KafkaProducer::new("localhost:9092")?;
-    // let (job_tx, job_rx) = tokio::sync::mpsc::channel::<Job>(100);
-    let jobs = Arc::new(JobStore::new(db.pool));
+    let jobs = Arc::new(JobStore::new(db));
     let cors = CorsLayer::new()
         .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
         .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
-    // jobs.migrate().await?;
-    let consumer = KafkaConsumer::new("localhost:9092", "judge-worker", runner, jobs.clone())?;
+    let consumer = KafkaConsumer::new(
+        "localhost:9092",
+        "judge-worker",
+        runner,
+        jobs.clone(),
+        kafka.producer.clone(),
+    )?;
     consumer.subscribe()?;
     tokio::spawn(async move {
         if let Err(error) = consumer.run().await {
