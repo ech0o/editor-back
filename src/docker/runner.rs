@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::docker::image::pull_if_needed;
 use crate::docker::workspace::{create_workspace, write_source};
+use crate::error::RunError;
 use crate::models::{ExecResult, RunResponse, RunStatus};
 use crate::workspace::Workspace;
 use anyhow::{Result, anyhow};
@@ -23,10 +24,11 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
-const RUN_TIMEOUT: Duration = Duration::from_secs(2);
+const RUN_TIMEOUT: Duration = Duration::from_secs(62);
 
 #[derive(Clone)]
 pub struct DockerRunner {
@@ -109,10 +111,15 @@ impl DockerRunner {
         crate::docker::exec::exec(self.docker(), id, cmd).await
     }
 
-    pub async fn run_rust(&self,job_id:Uuid, code: &str) -> anyhow::Result<RunResponse> {
-        let workspace = Workspace::new()?;
-        workspace.write("main.rs", code)?;
-        self.with_container("rust:1.89", workspace.path(), |id| async move {
+    pub async fn run_rust(
+        &self,
+        job_id: Uuid,
+        code: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<RunResponse, RunError> {
+        let workspace = Workspace::new().map_err(RunError::Other)?;
+        workspace.write("main.rs", code).map_err(RunError::Other)?;
+        self.with_container("rust:1.89", workspace.path(), cancel, |id| async move {
             let compile = tokio::time::timeout(
                 COMPILE_TIMEOUT,
                 self.exec(
@@ -217,16 +224,35 @@ impl DockerRunner {
         Ok(())
     }
 
-    pub async fn with_container<F, Fut, T>(&self, image: &str, workspace: &Path, f: F) -> Result<T>
+    pub async fn with_container<F, Fut>(
+        &self,
+        image: &str,
+        workspace: &Path,
+        cancel: CancellationToken,
+        f: F,
+    ) -> Result<RunResponse, RunError>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = anyhow::Result<T>>,
+        Fut: Future<Output = anyhow::Result<RunResponse, RunError>>,
     {
-        let id = self.create(image, workspace).await?;
-        let result = match self.start(id.as_str()).await {
-            Ok(()) => f(id.clone()).await,
-            Err(err) => Err(err),
+        let id = self
+            .create(image, workspace)
+            .await
+            .map_err(RunError::Other)?;
+        self.start(id.as_str()).await.map_err(RunError::Other)?;
+        let result = tokio::select! {
+                res = f(id.clone())=>{
+                    res
+                }
+                _= cancel.cancelled() => {
+                    tracing::warn!(container_id = %id,"container execution cancelled");
+                    if let Err(err)=self.stop(id.as_str()).await{
+                    tracing::warn!(container_id = %id,err=%err,"failed to stop container");
+                }
+                    Err(RunError::Cancelled)
+            }
         };
+
         // let result = f(id.clone()).await;
         // if let Err(e) = self.cleanup_container(id.as_str()).await {
         //     tracing::warn!(container_id = %id,
@@ -265,7 +291,7 @@ impl DockerRunner {
 }
 // mod test {
 //     use super::*;
-// 
+//
 //     async fn runner() -> DockerRunner {
 //         let docker = Docker::connect_with_local_defaults().unwrap();
 //         DockerRunner::new(Arc::new(docker))
@@ -275,13 +301,13 @@ impl DockerRunner {
 //         let runner = runner().await;
 //         let code = r#"
 //               use std::fs;
-// 
+//
 // fn main() {
 //     fs::write("/workspace/test.txt", "hello").unwrap();
 //     println!("ok");
 // }
 //                 "#;
-// 
+//
 //         let result = runner.run_rust(code).await?;
 //         // assert!(matches!(result.status, RunStatus::Accepted));
 //         // assert_eq!(result.exit_code, 0);
@@ -289,11 +315,11 @@ impl DockerRunner {
 //         println!("{:#?}", result);
 //         Ok(())
 //     }
-// 
+//
 //     #[tokio::test]
 //     async fn run_compile_error() {
 //         let runner = runner().await;
-// 
+//
 //         let result = runner
 //             .run_rust(
 //                 r#"
@@ -305,17 +331,17 @@ impl DockerRunner {
 //             )
 //             .await
 //             .expect("run_rust failed");
-// 
+//
 //         assert!(matches!(result.status, RunStatus::CompileError));
-// 
+//
 //         assert_ne!(result.exit_code, 0);
 //         assert!(!result.stderr.is_empty());
 //     }
-// 
+//
 //     #[tokio::test]
 //     async fn run_timeout() {
 //         let runner = runner().await;
-// 
+//
 //         let result = runner
 //             .run_rust(
 //                 r#"
@@ -326,20 +352,20 @@ impl DockerRunner {
 //             )
 //             .await
 //             .expect("run_rust failed");
-// 
+//
 //         assert!(matches!(result.status, RunStatus::TimeLimitExceeded));
 //     }
-// 
+//
 //     #[tokio::test]
 //     async fn run_memory_limit() {
 //         let runner = runner().await;
-// 
+//
 //         let result = runner
 //             .run_rust(
 //                 r#"
 //             fn main() {
 //                 let mut data = Vec::new();
-// 
+//
 //                 loop {
 //                     data.push(vec![0u8; 1024 * 1024]);
 //                 }
@@ -354,12 +380,12 @@ impl DockerRunner {
 //     #[tokio::test]
 //     async fn capture_stdout_and_stderr() {
 //         let runner = runner().await;
-// 
+//
 //         let result = runner
 //             .run_rust(
 //                 r#"
 //             use std::fs;
-// 
+//
 // fn main() {
 //     fs::write("/tmp/test.txt", "hello").unwrap();
 //     println!("ok");
@@ -368,13 +394,13 @@ impl DockerRunner {
 //             )
 //             .await
 //             .expect("run_rust failed");
-// 
+//
 //         assert!(matches!(result.status, RunStatus::Accepted));
-// 
+//
 //         assert!(result.stdout.contains("stdout"));
 //         assert!(result.stderr.contains("stderr"));
 //     }
-// 
+//
 //     #[tokio::test]
 //     async fn parallel_test() {
 //         let code_a = r#"
