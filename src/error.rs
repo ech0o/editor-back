@@ -16,3 +16,10 @@ pub enum ProcessError {
 //         ProcessError::Permanent(e)
 //     }
 // }
+#[derive(thiserror::Error, Debug)]
+pub enum RunError{
+    #[error("execution cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
