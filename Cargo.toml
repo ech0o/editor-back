@@ -30,3 +30,5 @@ sqlx = { version = "0.8", features = [
 ] }
 dotenvy = "0.15.7"
 dotenvy_macro = "0.15.7"
+tokio-util = "0.7.19"
+prometheus = "0.14.0"
