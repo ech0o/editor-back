@@ -55,6 +55,6 @@ pub async fn exec(docker: &Docker, container_id: &str, cmd: Vec<String>) -> Resu
     Ok(ExecResult {
         stdout:String::from_utf8_lossy(&stdout).to_string(),
         stderr:String::from_utf8_lossy(&stderr).to_string(),
-        exit_code:Some(exit_code),
+        exit_code:Some(exit_code as i32),
     })
 }

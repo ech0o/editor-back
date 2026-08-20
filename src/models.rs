@@ -68,14 +68,14 @@ pub struct RunResponse {
     pub stdout: String,
     pub status: RunStatus,
     pub stderr: String,
-    pub exit_code: i64,
+    pub exit_code: i32,
     pub job_id: Uuid,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
-    pub exit_code: Option<i64>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -90,7 +90,7 @@ pub struct JobResponse {
     pub status: RunStatus,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
-    pub exit_code: Option<i64>,
+    pub exit_code: Option<i32>,
 }
 
 impl From<Job> for JobResponse {

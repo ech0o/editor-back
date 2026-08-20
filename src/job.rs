@@ -15,7 +15,7 @@ pub struct Job {
     pub status: RunStatus,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
-    pub exit_code: Option<i64>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,7 +196,7 @@ SET status = $1 WHERE id = $2"#,
         status: RunStatus,
         stdout: Option<String>,
         stderr: Option<String>,
-        exit_code: Option<i64>,
+        exit_code: Option<i32>,
         lock_token:Uuid
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
@@ -225,10 +225,10 @@ SET status = $1 WHERE id = $2"#,
         .await?;
         tracing::info!(result = ?result,status=?status, "finish job status");
         if result.rows_affected() == 0 {
-            anyhow::bail!("job not found: {id}");
+            anyhow::bail!("job lease lost: {id}");
         }
 
-        Ok(result.rows_affected() == 1)
+        Ok(true)
     }
 
     pub async fn heartbeat(&self, id: Uuid, lock_token: Uuid) -> anyhow::Result<bool> {
