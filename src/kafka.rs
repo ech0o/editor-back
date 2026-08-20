@@ -1,5 +1,5 @@
 use crate::docker::DockerRunner;
-use crate::error::ProcessError;
+use crate::error::{ProcessError, RunError};
 use crate::job::{Job, JobStore};
 use crate::models::{DlqMessage, JobMessage, RunStatus};
 use anyhow::{anyhow, bail};
@@ -10,6 +10,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct KafkaProducer {
 }
 
 pub struct KafkaConsumer {
+    worker_id: i32,
     consumer: StreamConsumer,
     producer: FutureProducer,
     runner: DockerRunner,
@@ -54,6 +56,7 @@ impl KafkaConsumer {
         runner: DockerRunner,
         jobs: Arc<JobStore>,
         producer: FutureProducer,
+        worker_id: i32,
     ) -> anyhow::Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", broker)
@@ -66,6 +69,7 @@ impl KafkaConsumer {
             runner,
             jobs,
             producer,
+            worker_id,
         })
     }
 
@@ -78,6 +82,12 @@ impl KafkaConsumer {
         &self,
         message: &BorrowedMessage<'_>,
     ) -> anyhow::Result<(), ProcessError> {
+        tracing::info!(
+            worker_id = self.worker_id,
+            partition = message.partition(),
+            offset = message.offset(),
+            "received job"
+        );
         let payload = message
             .payload()
             .ok_or_else(|| ProcessError::Permanent(anyhow!("no payload")))?;
@@ -97,21 +107,38 @@ impl KafkaConsumer {
         let Some(lock_token) = lock_token else {
             return Ok(());
         };
+        // let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
         let jobs = self.jobs.clone();
         let job_id = job.id;
+        let heartbeat_cancel = cancel.clone();
+        let heartbeat_err = Arc::new(Mutex::new(None));
+        let heartbeat_error = Arc::clone(&heartbeat_err);
         let heartbeat = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
-                interval.tick().await;
-                match jobs.heartbeat(job_id, lock_token).await {
-                    Ok(true) => {
-                        tracing::debug!(job_id=%job_id,"job lease renewed");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match jobs.heartbeat(job_id, lock_token).await {
+                            Ok(true) => {
+                                tracing::info!(job_id=%job_id,"job lease renewed");
+                            }
+                            Ok(false) => {
+                                tracing::warn!(job_id=%job_id,"job lease lost");
+                                // let _ = shutdown_tx.send(true);
+                                heartbeat_cancel.cancel();
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::error!(job_id=%job_id,"job heartbeat database error: {}", err);
+                                *heartbeat_error.lock().await = Some(err.to_string());
+                                heartbeat_cancel.cancel();
+                                break;
+                            }
+                        }
                     }
-                    Ok(false) => {
-                        tracing::warn!(job_id=%job_id,"job lease lost");
-                    }
-                    Err(err) => {
-                        tracing::error!(job_id=%job_id,"job heard unrecoverable error: {}", err);
+                    _ = heartbeat_cancel.cancelled() => {
+                        break;
                     }
                 }
             }
@@ -121,8 +148,9 @@ impl KafkaConsumer {
             .update_status(job.id, RunStatus::Running)
             .await
             .map_err(ProcessError::Retryable)?;
+
         let result = match job.language.as_str() {
-            "rust" => self.runner.run_rust(job.id, &job.code).await,
+            "rust" => self.runner.run_rust(job.id, &job.code, cancel).await,
             _ => {
                 heartbeat.abort();
                 self.jobs
@@ -142,7 +170,19 @@ impl KafkaConsumer {
                 )));
             }
         };
+        let heartbeat_err = heartbeat_err.lock().await.take();
+        if let Some(err) = heartbeat_err {
+            return Err(ProcessError::Retryable(anyhow!(
+                "heartbeat database error: {}",
+                err
+            )));
+        }
+
         heartbeat.abort();
+        // let Some(result) = result else {
+        //     tracing::warn!(job_id=%job.id,"job execution aborted because lease was lost");
+        //     return Err(ProcessError::Retryable(anyhow!("job lease lost")));
+        // };
         match result {
             Ok(res) => {
                 self.jobs
@@ -157,7 +197,14 @@ impl KafkaConsumer {
                     .await
                     .map_err(ProcessError::Retryable)?;
             }
-            Err(err) => {
+            Err(RunError::Cancelled) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    "job execution cancelled because lease was lost"
+                );
+                return Err(ProcessError::Retryable(anyhow!("job lease lost")));
+            }
+            Err(RunError::Other(err)) => {
                 self.jobs
                     .finish(
                         job.id,
