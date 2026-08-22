@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         // // .route("/exec", get(exec))
         // .route("/mount", get(workspace))
         .route("/run", post(run_handle))
+        .route("/metrics",get(metrics))
         .route("/run/{job_id}", get(get_job))
 }
 
@@ -145,4 +146,10 @@ async fn get_job(
     let job = state.jobs.get(job_id).await?.ok_or(ApiError::JobNotFound)?;
 
     Ok(Json(job.into()))
+}
+
+async fn metrics()->impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+     crate::metrics::gather()
+    )
 }
