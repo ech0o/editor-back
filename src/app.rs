@@ -17,18 +17,28 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::ClientConfig;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     let docker = Docker::connect_with_local_defaults()?;
     let runner = DockerRunner::new(Arc::new(docker));
-    let db = PgPool::connect("postgres://postgres:example@localhost:5432/postgres").await?;
-    let kafka = KafkaProducer::new("localhost:9092")?;
+    let db_addr = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:example@localhost:5432/postgres".to_string());
+    println!("db_addr: {:?}", db_addr);
+    let db = PgPool::connect(db_addr.as_str()).await?;
+    let kafka_addr =
+        std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    println!("kafka_addr: {:?}", kafka_addr);
+    ensure_topic_exists(kafka_addr.as_str(),"judge.jobs").await?;
+    let kafka = KafkaProducer::new(kafka_addr.as_str())?;
     let jobs = Arc::new(JobStore::new(db));
 
     let cors = CorsLayer::new()
@@ -41,7 +51,8 @@ pub async fn create_app() -> anyhow::Result<()> {
         .merge(routes::router())
         .with_state(AppState::new(jobs.clone(), kafka.clone()));
     if args.get(1).map(String::as_str) == Some("worker") {
-        run_worker(jobs, kafka, runner).await?;
+        init_metrics()?;
+        run_worker(jobs, kafka, runner, kafka_addr).await?;
     } else {
         run_api(router).await?;
     }
@@ -52,16 +63,17 @@ async fn run_worker(
     jobs: Arc<JobStore>,
     kafka: KafkaProducer,
     docker_runner: DockerRunner,
+    kafka_addr: String,
 ) -> anyhow::Result<()> {
-    let worker_id = std::env::var("WORKER_ID").unwrap_or_else(|_| "unknown".to_string());
-
+    let worker_id = hostname::get().unwrap_or_default().to_string_lossy().into_owned();
+    tracing::info!("initializing worker,{}",kafka_addr.as_str());
     let consumer = KafkaConsumer::new(
-        "localhost:9092",
+        kafka_addr.as_str(),
         "judge-worker",
         docker_runner.clone(),
         jobs,
         kafka.producer.clone(),
-        worker_id.parse()?,
+        worker_id.as_str(),
     )?;
     tracing::info!(
         worker_id = worker_id,
@@ -106,6 +118,30 @@ async fn run_api(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    Ok(())
+}
+
+
+pub async fn ensure_topic_exists(brokers: &str, topic_name: &str)->anyhow::Result<()> {
+    let admin_client: AdminClient<_> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("AdminClient failed to create admin client");
+    tracing::info!("Admin client:");
+    let new_topic = NewTopic::new(topic_name, 3, TopicReplication::Fixed(1));
+
+    // 尝试创建 Topic，如果已存在会返回错误，直接忽略即可
+     let res= admin_client
+        .create_topics(&[new_topic], &AdminOptions::new())
+        .await;
+
+    tracing::info!("Topic '{:?}' ready", res);
+    Ok(())
+}
+
+fn init_metrics()->anyhow::Result<()>{
+    PrometheusBuilder::new().with_http_listener(([0,0,0,0],9091)).install()?;
+    metrics::counter!("worker_started_total").increment(1);
     Ok(())
 }
 
@@ -179,28 +215,28 @@ mod tests {
 //     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
 //         .await
 //         .unwrap();
-// 
+//
 //     let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
-// 
+//
 //     assert_eq!(error.error, "invalid_json");
 // }
-// 
+//
 // #[tokio::test]
 // async fn post_run_rejects_missing_code() {
 //     let app = create_app().await.unwrap();
-// 
+//
 //     let request = Request::builder()
 //         .method("POST")
 //         .uri("/run")
 //         .header("content-type", "application/json")
 //         .body(Body::from(r#"{"foo":"bar"}"#))
 //         .unwrap();
-// 
+//
 //     let response = app.oneshot(request).await.unwrap();
-// 
+//
 //     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 // }
-// 
+//
 // #[tokio::test]
 // async fn post_run_rejects_large_body() {
 //     let app = create_app().await.unwrap();
