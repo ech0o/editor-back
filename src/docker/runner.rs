@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
-const RUN_TIMEOUT: Duration = Duration::from_secs(62);
+const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct DockerRunner {
@@ -118,8 +118,8 @@ impl DockerRunner {
         cancel: CancellationToken,
     ) -> anyhow::Result<RunResponse, RunError> {
         let workspace = Workspace::new().map_err(RunError::Other)?;
-        workspace.write("main.rs", code).map_err(RunError::Other)?;
-        self.with_container("rust:1.89", workspace.path(), cancel, |id| async move {
+        workspace.write("main.rs", code)?;
+        self.with_container("rust:1.89", workspace.host_path(), cancel, |id| async move {
             let compile = tokio::time::timeout(
                 COMPILE_TIMEOUT,
                 self.exec(
@@ -171,6 +171,7 @@ impl DockerRunner {
                 });
             }
             let res = timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspace/main".into()])).await;
+            tracing::info!(job_id=?job_id, result=?res, "finished exec");
             match res {
                 Ok(result) => {
                     let result = result?;
@@ -240,6 +241,7 @@ impl DockerRunner {
             .await
             .map_err(RunError::Other)?;
         self.start(id.as_str()).await.map_err(RunError::Other)?;
+        tracing::info!(id=?id, "started container");
         let result = tokio::select! {
                 res = f(id.clone())=>{
                     res
