@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "workers"
+
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+
+    relabel_configs:
+      - source_labels:
+          - __meta_docker_container_label_com_docker_compose_service
+        regex: worker
+        action: keep
+
+      - source_labels:
+          - __meta_docker_network_ip
+        regex: "(.+)"
+        target_label: __address__
+        replacement: "$1:9091"
