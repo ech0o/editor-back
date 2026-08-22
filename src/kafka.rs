@@ -8,6 +8,7 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -19,7 +20,7 @@ pub struct KafkaProducer {
 }
 
 pub struct KafkaConsumer {
-    worker_id: i32,
+    worker_id: String,
     consumer: StreamConsumer,
     producer: FutureProducer,
     runner: DockerRunner,
@@ -31,6 +32,7 @@ impl KafkaProducer {
         let producer = ClientConfig::new()
             .set("bootstrap.servers", broker)
             .create()?;
+        tracing::info!("Kafka producer created");
         Ok(Self { producer })
     }
 
@@ -56,7 +58,7 @@ impl KafkaConsumer {
         runner: DockerRunner,
         jobs: Arc<JobStore>,
         producer: FutureProducer,
-        worker_id: i32,
+        worker_id: &str,
     ) -> anyhow::Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", broker)
@@ -69,7 +71,7 @@ impl KafkaConsumer {
             runner,
             jobs,
             producer,
-            worker_id,
+            worker_id: String::from(worker_id),
         })
     }
 
@@ -170,6 +172,7 @@ impl KafkaConsumer {
                 )));
             }
         };
+        tracing::info!(result=?result,"run code result");
         let heartbeat_err = heartbeat_err.lock().await.take();
         if let Some(err) = heartbeat_err {
             return Err(ProcessError::Retryable(anyhow!(
