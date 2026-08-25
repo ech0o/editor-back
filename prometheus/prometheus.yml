@@ -18,3 +18,9 @@ scrape_configs:
         regex: "(.+)"
         target_label: __address__
         replacement: "$1:9091"
+
+      - source_labels:
+          - __meta_docker_container_name
+        regex: "/.*-worker-([0-9]+)"
+        target_label: worker_id
+        replacement: "worker-$1"
