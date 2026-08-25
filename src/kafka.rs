@@ -1,8 +1,10 @@
 use crate::docker::DockerRunner;
 use crate::error::{ProcessError, RunError};
 use crate::job::{Job, JobStore};
+use crate::metrics::{Metrics, RunningGuard, job_completed, job_duration, job_failed};
 use crate::models::{DlqMessage, JobMessage, RunStatus};
 use anyhow::{anyhow, bail};
+use chrono::Utc;
 use futures_util::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::BorrowedMessage;
@@ -25,6 +27,7 @@ pub struct KafkaConsumer {
     producer: FutureProducer,
     runner: DockerRunner,
     jobs: Arc<JobStore>,
+    metrics: Arc<Metrics>,
 }
 
 impl KafkaProducer {
@@ -59,6 +62,7 @@ impl KafkaConsumer {
         jobs: Arc<JobStore>,
         producer: FutureProducer,
         worker_id: &str,
+        metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", broker)
@@ -72,6 +76,7 @@ impl KafkaConsumer {
             jobs,
             producer,
             worker_id: String::from(worker_id),
+            metrics,
         })
     }
 
@@ -101,6 +106,12 @@ impl KafkaConsumer {
             .await
             .map_err(ProcessError::Retryable)?
             .ok_or_else(|| ProcessError::Permanent(anyhow!("job {} not found", job_msg.job_id)))?;
+        let queue_latency = (Utc::now() - job.created_at.unwrap())
+            .to_std()
+            .expect("metric time to_std error");
+        self.metrics
+            .job_queue_latency_seconds
+            .observe(queue_latency.as_secs_f64());
         let lock_token = self
             .jobs
             .try_start(job.id)
@@ -150,9 +161,12 @@ impl KafkaConsumer {
             .update_status(job.id, RunStatus::Running)
             .await
             .map_err(ProcessError::Retryable)?;
-
+        let _start = self.metrics.job_duration_seconds.start_timer();
         let result = match job.language.as_str() {
-            "rust" => self.runner.run_rust(job.id, &job.code, cancel).await,
+            "rust" => {
+                let _running = RunningGuard::new(self.metrics.jobs_running.clone());
+                self.runner.run_rust(job.id, &job.code, cancel).await
+            }
             _ => {
                 heartbeat.abort();
                 self.jobs
@@ -180,7 +194,7 @@ impl KafkaConsumer {
                 err
             )));
         }
-
+        // start.observe_duration();
         heartbeat.abort();
         // let Some(result) = result else {
         //     tracing::warn!(job_id=%job.id,"job execution aborted because lease was lost");
@@ -188,6 +202,7 @@ impl KafkaConsumer {
         // };
         match result {
             Ok(res) => {
+                self.metrics.jobs_finished_total.inc();
                 self.jobs
                     .finish(
                         job.id,
@@ -208,6 +223,7 @@ impl KafkaConsumer {
                 return Err(ProcessError::Retryable(anyhow!("job lease lost")));
             }
             Err(RunError::Other(err)) => {
+                self.metrics.jobs_failed_total.inc();
                 self.jobs
                     .finish(
                         job.id,
