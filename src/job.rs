@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, mpsc};
-use uuid::Uuid;
+use uuid::{ Uuid};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -16,6 +17,7 @@ pub struct Job {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub exit_code: Option<i32>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,7 +86,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
         }
     }
     pub async fn get_and_queued(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
-        let row = sqlx::query(
+        let row = sqlx::query_as!(Job,
             r#"
         SELECT
             id,
@@ -93,39 +95,40 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             status,
             stdout,
             stderr,
-            exit_code
+            exit_code,
+            created_at
         FROM jobs
         WHERE id = $1
-        "#,
+        "#,id
         )
-        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(row) = row else {
+        let Some(job) = row else {
             return Ok(None);
         };
-        let mut job = Job {
-            id: row.try_get("id")?,
-            language: row.try_get("language")?,
-            code: row.try_get("code")?,
-            status: RunStatus::Queued,
-            stdout: row.try_get("stdout")?,
-            stderr: row.try_get("stderr")?,
-            exit_code: row.try_get("exit_code")?,
-        };
+        // let mut job = Job {
+        //     id: row.try_get("id")?,
+        //     language: row.try_get("language")?,
+        //     code: row.try_get("code")?,
+        //     status: RunStatus::Queued,
+        //     stdout: row.try_get("stdout")?,
+        //     stderr: row.try_get("stderr")?,
+        //     exit_code: row.try_get("exit_code")?,
+        //     created_at:row.try_get("created_at")?,
+        // };
         self.update_status(job.id, RunStatus::Queued).await?;
-        let status = match row.try_get("status")? {
-            "Accepted" => RunStatus::Accepted,
-            "Queued" => RunStatus::Queued,
-            "Running" => RunStatus::Running,
-            "Success" => RunStatus::Success,
-            "CompileError" => RunStatus::CompileError,
-            "RuntimeError" => RunStatus::RuntimeError,
-            "TimeLimitExceeded" => RunStatus::TimeLimitExceeded,
-            "MemoryLimitExceeded" => RunStatus::MemoryLimitExceeded,
-            status => anyhow::bail!("unknown run status: {status}"),
-        };
-        job.status = status;
+        // let status = match row.try_get("status")? {
+        //     "Accepted" => RunStatus::Accepted,
+        //     "Queued" => RunStatus::Queued,
+        //     "Running" => RunStatus::Running,
+        //     "Success" => RunStatus::Success,
+        //     "CompileError" => RunStatus::CompileError,
+        //     "RuntimeError" => RunStatus::RuntimeError,
+        //     "TimeLimitExceeded" => RunStatus::TimeLimitExceeded,
+        //     "MemoryLimitExceeded" => RunStatus::MemoryLimitExceeded,
+        //     status => anyhow::bail!("unknown run status: {status}"),
+        // };
+        // job.status = status;
         Ok(Some(job))
     }
 
@@ -170,6 +173,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             stdout: row.try_get("stdout")?,
             stderr: row.try_get("stderr")?,
             exit_code: row.try_get("exit_code")?,
+            created_at: None,
         };
         Ok(Some(job))
     }
