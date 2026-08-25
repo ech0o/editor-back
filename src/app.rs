@@ -3,6 +3,7 @@ use crate::db::Database;
 use crate::docker::DockerRunner;
 use crate::job::{Job, JobStore};
 use crate::kafka::{KafkaConsumer, KafkaProducer};
+use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
 use crate::state::JobState;
 use crate::{routes, shutdown_signal, state::AppState};
@@ -13,18 +14,18 @@ use axum::{
     http::{Request, StatusCode},
 };
 use bollard::Docker;
+use metrics_exporter_prometheus::PrometheusBuilder;
+use rdkafka::ClientConfig;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::ClientConfig;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -37,10 +38,10 @@ pub async fn create_app() -> anyhow::Result<()> {
     let kafka_addr =
         std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
     println!("kafka_addr: {:?}", kafka_addr);
-    ensure_topic_exists(kafka_addr.as_str(),"judge.jobs").await?;
+    ensure_topic_exists(kafka_addr.as_str(), "judge.jobs").await?;
     let kafka = KafkaProducer::new(kafka_addr.as_str())?;
     let jobs = Arc::new(JobStore::new(db));
-
+    let metrics = Arc::new(Metrics::new()?);
     let cors = CorsLayer::new()
         .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
         .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
@@ -49,10 +50,9 @@ pub async fn create_app() -> anyhow::Result<()> {
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .layer(cors)
         .merge(routes::router())
-        .with_state(AppState::new(jobs.clone(), kafka.clone()));
+        .with_state(AppState::new(jobs.clone(), kafka.clone(), metrics.clone()));
     if args.get(1).map(String::as_str) == Some("worker") {
-        init_metrics()?;
-        run_worker(jobs, kafka, runner, kafka_addr).await?;
+        run_worker(jobs, kafka, runner, kafka_addr, metrics).await?;
     } else {
         run_api(router).await?;
     }
@@ -64,9 +64,13 @@ async fn run_worker(
     kafka: KafkaProducer,
     docker_runner: DockerRunner,
     kafka_addr: String,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
-    let worker_id = hostname::get().unwrap_or_default().to_string_lossy().into_owned();
-    tracing::info!("initializing worker,{}",kafka_addr.as_str());
+    let worker_id = hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    tracing::info!("initializing worker,{}", kafka_addr.as_str());
     let consumer = KafkaConsumer::new(
         kafka_addr.as_str(),
         "judge-worker",
@@ -74,12 +78,21 @@ async fn run_worker(
         jobs,
         kafka.producer.clone(),
         worker_id.as_str(),
+        metrics.clone(),
     )?;
+    let listener = TcpListener::bind("0.0.0.0:9091").await?;
+    tracing::info!("Listening on http://0.0.0.0:9091");
     tracing::info!(
         worker_id = worker_id,
         pid = std::process::id(),
         "worker started"
     );
+    let router = Router::new()
+        .merge(routes::worker_router())
+        .with_state(metrics);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
     consumer.subscribe()?;
     consumer.run().await?;
     Ok(())
@@ -121,8 +134,7 @@ async fn run_api(
     Ok(())
 }
 
-
-pub async fn ensure_topic_exists(brokers: &str, topic_name: &str)->anyhow::Result<()> {
+pub async fn ensure_topic_exists(brokers: &str, topic_name: &str) -> anyhow::Result<()> {
     let admin_client: AdminClient<_> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
@@ -131,17 +143,11 @@ pub async fn ensure_topic_exists(brokers: &str, topic_name: &str)->anyhow::Resul
     let new_topic = NewTopic::new(topic_name, 3, TopicReplication::Fixed(1));
 
     // 尝试创建 Topic，如果已存在会返回错误，直接忽略即可
-     let res= admin_client
+    let res = admin_client
         .create_topics(&[new_topic], &AdminOptions::new())
         .await;
 
     tracing::info!("Topic '{:?}' ready", res);
-    Ok(())
-}
-
-fn init_metrics()->anyhow::Result<()>{
-    PrometheusBuilder::new().with_http_listener(([0,0,0,0],9091)).install()?;
-    metrics::counter!("worker_started_total").increment(1);
     Ok(())
 }
 
