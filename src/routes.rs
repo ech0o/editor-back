@@ -2,17 +2,20 @@ use crate::apierror::ApiError;
 use crate::docker::exec::ExecResult;
 use crate::docker::workspace::{create_workspace, write_source};
 use crate::job::Job;
+use crate::metrics::Metrics;
 use crate::models::{JobIdResponse, JobMessage, JobResponse, RunRequest, RunResponse, RunStatus};
 use crate::state::{AppState, JobState};
 use axum::error_handling::HandleError;
 use axum::extract::Path;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::routing::post;
 use axum::{Json, Router, extract::State, routing::get};
+use prometheus::Encoder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use chrono::Utc;
 use uuid::Uuid;
 
 pub fn router() -> Router<AppState> {
@@ -22,8 +25,11 @@ pub fn router() -> Router<AppState> {
         // // .route("/exec", get(exec))
         // .route("/mount", get(workspace))
         .route("/run", post(run_handle))
-        .route("/metrics",get(metrics))
         .route("/run/{job_id}", get(get_job))
+}
+
+pub fn worker_router() -> Router<Arc<Metrics>> {
+    Router::new().route("/metrics", get(metrics))
 }
 
 async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -41,57 +47,6 @@ async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
 struct CreateResponse {
     id: String,
 }
-
-// #[derive(Debug, Deserialize,Serialize)]
-// pub struct RunRequest {
-//     pub code: String,
-// }
-
-// async fn create_container(
-//     State(state): State<AppState>,
-// ) -> Json<CreateResponse> {
-//     let id = state
-//         .runner
-//         .create("rust:1.89")
-//         .await
-//         .unwrap();
-//
-//     Json(CreateResponse { id })
-// }
-
-// async fn exec(State(state): State<AppState>) -> Json<ExecResult> {
-//     let id = state.runner.create("ubuntu:latest").await.unwrap();
-//
-//     state.runner.start(&id).await.unwrap();
-//
-//     let result = state.runner.exec(
-//         &id,
-//         &vec![
-//             "echo".into(),
-//             "Hello".into(),
-//         ],
-//     ).await.unwrap();
-//
-//     state.runner.remove(&id).await.unwrap();
-//
-//     Json(result)
-// }
-
-// async fn workspace(State(state): State<AppState>) -> Json<ExecResult> {
-//     let workspace = create_workspace().unwrap();
-//     let _ = write_source(&workspace, "hello.txt", "Hello Docker!");
-//     let id = state
-//         .runner
-//         .create("ubuntu:latest", &workspace)
-//         .await
-//         .unwrap();
-//     let _ = state.runner.start(&id).await;
-//     let res = state
-//         .runner
-//         .exec(&id, vec!["cat".into(), "/workspace/hello.txt".into()])
-//         .await;
-//     Json(res.unwrap())
-// }
 
 async fn run_handle(
     State(state): State<AppState>,
@@ -131,6 +86,7 @@ async fn run_handle(
         stdout: None,
         stderr: None,
         exit_code: None,
+        created_at: None,
     };
     let job_id = job.id;
     let job_msg = JobMessage { job_id };
@@ -148,8 +104,12 @@ async fn get_job(
     Ok(Json(job.into()))
 }
 
-async fn metrics()->impl axum::response::IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-     crate::metrics::gather()
-    )
+async fn metrics(State(metrics): State<Arc<Metrics>>) -> impl axum::response::IntoResponse {
+    let encoder = prometheus::TextEncoder::new();
+    let metric_families = metrics.registry.gather();
+
+    let mut buffer = vec![];
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    let content_type = encoder.format_type().to_string();
+    ([(header::CONTENT_TYPE, content_type)], buffer)
 }
