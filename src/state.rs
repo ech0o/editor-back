@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use uuid::Uuid;
 use crate::db::Database;
+use crate::metrics::Metrics;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +18,7 @@ pub struct AppState {
     pub semaphore: Arc<Semaphore>,
     pub jobs: Arc<JobStore>,
     pub kafka: KafkaProducer,
+    pub metrics:Arc<Metrics>,
     // pub db:Database
 }
 
@@ -24,11 +26,13 @@ impl AppState {
     pub fn new(
         job_store: Arc<JobStore>,
         kafka_producer: KafkaProducer,
+        metrics: Arc<Metrics>
     ) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(4)),
             jobs: job_store,
             kafka: kafka_producer,
+            metrics,
         }
     }
 }
