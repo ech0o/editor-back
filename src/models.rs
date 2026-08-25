@@ -1,6 +1,7 @@
 use crate::job::Job;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use anyhow::bail;
 use serde::de::Visitor;
 use uuid::Uuid;
 
@@ -31,6 +32,22 @@ pub enum RunStatus {
     Queued,
     Running,
     Success,
+}
+
+impl From<String> for RunStatus {
+    fn from(code: String) -> Self {
+        match code.as_ref() {
+            "Accepted" => RunStatus::Accepted,
+            "CompileError" => RunStatus::CompileError,
+            "RuntimeError" => RunStatus::RuntimeError,
+            "TimeLimitExceeded" => RunStatus::TimeLimitExceeded,
+            "MemoryLimitExceeded" => RunStatus::MemoryLimitExceeded,
+            "Queued" => RunStatus::Queued,
+            "Running" => RunStatus::Running,
+            "Success" => RunStatus::Success,
+            _=>panic!("Unknown status: {}", code),
+        }
+    }
 }
 
 impl Display for RunStatus {
