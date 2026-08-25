@@ -108,3 +108,16 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+volumes:
+  grafana_data:
