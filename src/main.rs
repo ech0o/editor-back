@@ -10,13 +10,13 @@ mod kafka;
 mod models;
 mod state;
 mod workspace;
+mod metrics;
 
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    dotenvy::dotenv()?;
     app::create_app().await?;
 
     Ok(())
