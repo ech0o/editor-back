@@ -6,7 +6,7 @@ use crate::kafka::{KafkaConsumer, KafkaProducer};
 use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
 use crate::state::JobState;
-use crate::{routes, shutdown_signal, state::AppState};
+use crate::{routes, state::AppState};
 use axum::Router;
 use axum::http::{HeaderValue, Method};
 use axum::{
@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -71,6 +72,7 @@ async fn run_worker(
         .to_string_lossy()
         .into_owned();
     tracing::info!("initializing worker,{}", kafka_addr.as_str());
+    let shutdown = CancellationToken::new();
     let consumer = KafkaConsumer::new(
         kafka_addr.as_str(),
         "judge-worker",
@@ -79,7 +81,9 @@ async fn run_worker(
         kafka.producer.clone(),
         worker_id.as_str(),
         metrics.clone(),
+        shutdown.clone(),
     )?;
+    metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
     tracing::info!("Listening on http://0.0.0.0:9091");
     tracing::info!(
@@ -93,8 +97,14 @@ async fn run_worker(
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    consumer.subscribe()?;
-    consumer.run().await?;
+    let consumer_task = tokio::spawn(async move {
+        consumer.subscribe()?;
+        consumer.run().await
+    });
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received");
+    shutdown.cancel();
+    consumer_task.await??;
     Ok(())
 }
 async fn run_api(
@@ -149,6 +159,29 @@ pub async fn ensure_topic_exists(brokers: &str, topic_name: &str) -> anyhow::Res
 
     tracing::info!("Topic '{:?}' ready", res);
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[cfg(test)]

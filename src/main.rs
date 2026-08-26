@@ -22,8 +22,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
-}
+// async fn shutdown_signal() {
+//     tokio::signal::ctrl_c()
+//         .await
+//         .expect("failed to install CTRL+C signal handler");
+// }

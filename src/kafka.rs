@@ -14,6 +14,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -28,6 +29,7 @@ pub struct KafkaConsumer {
     runner: DockerRunner,
     jobs: Arc<JobStore>,
     metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
 }
 
 impl KafkaProducer {
@@ -63,6 +65,7 @@ impl KafkaConsumer {
         producer: FutureProducer,
         worker_id: &str,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", broker)
@@ -77,6 +80,7 @@ impl KafkaConsumer {
             producer,
             worker_id: String::from(worker_id),
             metrics,
+            shutdown,
         })
     }
 
@@ -161,7 +165,11 @@ impl KafkaConsumer {
             .update_status(job.id, RunStatus::Running)
             .await
             .map_err(ProcessError::Retryable)?;
-        let _start = self.metrics.job_duration_seconds.start_timer();
+        let _start = self
+            .metrics
+            .job_duration_seconds
+            .with_label_values(&[&self.worker_id])
+            .start_timer();
         let result = match job.language.as_str() {
             "rust" => {
                 let _running = RunningGuard::new(self.metrics.jobs_running.clone());
@@ -202,7 +210,57 @@ impl KafkaConsumer {
         // };
         match result {
             Ok(res) => {
-                self.metrics.jobs_finished_total.inc();
+                self.metrics
+                    .jobs_finished_total
+                    .with_label_values(&[&self.worker_id])
+                    .inc();
+                match res.status {
+                    RunStatus::Accepted => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["accepted"])
+                            .inc();
+                    }
+                    RunStatus::CompileError => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["CompileError"])
+                            .inc();
+                    }
+                    RunStatus::RuntimeError => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["RuntimeError"])
+                            .inc();
+                    }
+                    RunStatus::TimeLimitExceeded => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["TimeLimitExceeded"])
+                            .inc();
+                    }
+                    RunStatus::MemoryLimitExceeded => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["MemoryLimitExceeded"])
+                            .inc();
+                    }
+                    RunStatus::Queued => {
+                        self.metrics.jobs_total.with_label_values(&["Queued"]).inc();
+                    }
+                    RunStatus::Running => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["Running"])
+                            .inc();
+                    }
+                    RunStatus::Success => {
+                        self.metrics
+                            .jobs_total
+                            .with_label_values(&["Success"])
+                            .inc();
+                    }
+                }
                 self.jobs
                     .finish(
                         job.id,
@@ -243,6 +301,12 @@ impl KafkaConsumer {
         let mut stream = self.consumer.stream();
         loop {
             tokio::select! {
+                biased;
+                 _ = self.shutdown.cancelled() => {
+                    // result?;
+                    tracing::info!("shutdown signal received");
+                    break;
+                }
                 message = stream.next() => {
                     let Some(message) = message else{
                         break;
@@ -278,11 +342,7 @@ impl KafkaConsumer {
                         }
                     }
                 }
-                result = tokio::signal::ctrl_c() => {
-                    result?;
-                    tracing::info!("shutdown signal received");
-                    break;
-                }
+
             }
         }
         tracing::info!("consumer stopped");
