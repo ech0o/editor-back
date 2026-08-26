@@ -88,6 +88,7 @@ services:
       - "9091"
 #    deploy:
 #      replicas: 3
+    stop_grace_period: 30s
   server:
     build:
       context: .
