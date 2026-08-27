@@ -18,6 +18,7 @@ pub struct Job {
     pub stderr: Option<String>,
     pub exit_code: Option<i32>,
     pub created_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,12 +67,16 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
                 status = 'Running',
                 locked_at = NOW(),
                 lock_token = $2,
-                updated_at = NOW()
+                updated_at = NOW(),
+                heartbeat_at = NOW()
             WHERE id = $1
             AND (status = 'Queued'
                 OR (
                     status = 'Running'
-                    AND locked_at < NOW() - INTERVAL '30 seconds'
+                    AND (
+                        heartbeat_at IS NULL
+                        OR heartbeat_at < NOW() - INTERVAL '30 seconds'
+                        )
                 ))
 "#,
         )
@@ -96,7 +101,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             stdout,
             stderr,
             exit_code,
-            created_at
+            created_at,
+            heartbeat_at
         FROM jobs
         WHERE id = $1
         "#,id
@@ -174,6 +180,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             stderr: row.try_get("stderr")?,
             exit_code: row.try_get("exit_code")?,
             created_at: None,
+            heartbeat_at: None,
         };
         Ok(Some(job))
     }
@@ -240,8 +247,8 @@ SET status = $1 WHERE id = $2"#,
             r#"
             UPDATE jobs
             SET 
-                locked_at = NOW(),
-                updated_at = NOW()
+                updated_at = NOW(),
+                heartbeat_at = NOW()
             WHERE id = $1
             AND  status = 'Running'
             AND lock_token = $2
