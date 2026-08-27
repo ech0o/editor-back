@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     cmake \
     libssl-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 # 2. 预编译依赖项 (利用 Docker 缓存机制)
 COPY Cargo.toml Cargo.lock ./

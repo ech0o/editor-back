@@ -11,11 +11,11 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::{StatusCode, header};
 use axum::routing::post;
 use axum::{Json, Router, extract::State, routing::get};
+use chrono::Utc;
 use prometheus::Encoder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use chrono::Utc;
 use uuid::Uuid;
 
 pub fn router() -> Router<AppState> {
@@ -29,7 +29,9 @@ pub fn router() -> Router<AppState> {
 }
 
 pub fn worker_router() -> Router<Arc<Metrics>> {
-    Router::new().route("/metrics", get(metrics))
+    Router::new()
+        .route("/metrics", get(metrics))
+        .route("/health", get(health))
 }
 
 async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -87,6 +89,7 @@ async fn run_handle(
         stderr: None,
         exit_code: None,
         created_at: None,
+        heartbeat_at: None,
     };
     let job_id = job.id;
     let job_msg = JobMessage { job_id };
@@ -112,4 +115,8 @@ async fn metrics(State(metrics): State<Arc<Metrics>>) -> impl axum::response::In
     encoder.encode(&metric_families, &mut buffer).unwrap();
     let content_type = encoder.format_type().to_string();
     ([(header::CONTENT_TYPE, content_type)], buffer)
+}
+
+async fn health() -> impl axum::response::IntoResponse {
+    StatusCode::OK
 }

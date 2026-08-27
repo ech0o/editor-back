@@ -89,6 +89,13 @@ services:
 #    deploy:
 #      replicas: 3
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD","curl","-f","http://127.0.0.1:9091/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
   server:
     build:
       context: .
