@@ -118,44 +118,48 @@ impl KafkaConsumer {
             .observe(queue_latency.as_secs_f64());
         let lock_token = self
             .jobs
-            .try_start(job.id)
+            .try_start(job.id, self.worker_id.clone())
             .await
             .map_err(ProcessError::Retryable)?;
         let Some(lock_token) = lock_token else {
             return Ok(());
         };
         // let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_execution = tokio_util::sync::CancellationToken::new();
         let jobs = self.jobs.clone();
         let job_id = job.id;
-        let heartbeat_cancel = cancel.clone();
+        let heartbeat_cancel = CancellationToken::new();
         let heartbeat_err = Arc::new(Mutex::new(None));
         let heartbeat_error = Arc::clone(&heartbeat_err);
-        let heartbeat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        match jobs.heartbeat(job_id, lock_token).await {
-                            Ok(true) => {
-                                tracing::info!(job_id=%job_id,"job lease renewed");
-                            }
-                            Ok(false) => {
-                                tracing::warn!(job_id=%job_id,"job lease lost");
-                                // let _ = shutdown_tx.send(true);
-                                heartbeat_cancel.cancel();
-                                break;
-                            }
-                            Err(err) => {
-                                tracing::error!(job_id=%job_id,"job heartbeat database error: {}", err);
-                                *heartbeat_error.lock().await = Some(err.to_string());
-                                heartbeat_cancel.cancel();
-                                break;
+        let heartbeat = tokio::spawn({
+            let cancel_execution = cancel_execution.clone();
+            let heartbeat_cancel = heartbeat_cancel.clone();
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            match jobs.heartbeat(job_id, lock_token).await {
+                                Ok(true) => {
+                                    tracing::info!(job_id=%job_id,"job lease renewed");
+                                }
+                                Ok(false) => {
+                                    tracing::warn!(job_id=%job_id,"job lease lost");
+                                    // let _ = shutdown_tx.send(true);
+                                    cancel_execution.cancel();
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::error!(job_id=%job_id,"job heartbeat database error: {}", err);
+                                    *heartbeat_error.lock().await = Some(err.to_string());
+                                    heartbeat_cancel.cancel();
+                                    break;
+                                }
                             }
                         }
-                    }
-                    _ = heartbeat_cancel.cancelled() => {
-                        break;
+                        _ = heartbeat_cancel.cancelled() => {
+                            break;
+                        }
                     }
                 }
             }
@@ -165,15 +169,17 @@ impl KafkaConsumer {
             .update_status(job.id, RunStatus::Running)
             .await
             .map_err(ProcessError::Retryable)?;
-        let _start = self
-            .metrics
-            .job_duration_seconds
-            .with_label_values(&[&self.worker_id])
-            .start_timer();
         let result = match job.language.as_str() {
             "rust" => {
+                let _start = self
+                    .metrics
+                    .job_duration_seconds
+                    .with_label_values(&[&self.worker_id])
+                    .start_timer();
                 let _running = RunningGuard::new(self.metrics.jobs_running.clone());
-                self.runner.run_rust(job.id, &job.code, cancel).await
+                self.runner
+                    .run_rust(job.id, &job.code, cancel_execution)
+                    .await
             }
             _ => {
                 heartbeat.abort();
@@ -202,65 +208,16 @@ impl KafkaConsumer {
                 err
             )));
         }
-        // start.observe_duration();
-        heartbeat.abort();
-        // let Some(result) = result else {
+        // heartbeat.abort();
+        heartbeat_cancel.cancel();
+        let _ = heartbeat.await;
+        // let Some(result) =
+        // result else {
         //     tracing::warn!(job_id=%job.id,"job execution aborted because lease was lost");
         //     return Err(ProcessError::Retryable(anyhow!("job lease lost")));
         // };
         match result {
             Ok(res) => {
-                self.metrics
-                    .jobs_finished_total
-                    .with_label_values(&[&self.worker_id])
-                    .inc();
-                match res.status {
-                    RunStatus::Accepted => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["accepted"])
-                            .inc();
-                    }
-                    RunStatus::CompileError => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["CompileError"])
-                            .inc();
-                    }
-                    RunStatus::RuntimeError => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["RuntimeError"])
-                            .inc();
-                    }
-                    RunStatus::TimeLimitExceeded => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["TimeLimitExceeded"])
-                            .inc();
-                    }
-                    RunStatus::MemoryLimitExceeded => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["MemoryLimitExceeded"])
-                            .inc();
-                    }
-                    RunStatus::Queued => {
-                        self.metrics.jobs_total.with_label_values(&["Queued"]).inc();
-                    }
-                    RunStatus::Running => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["Running"])
-                            .inc();
-                    }
-                    RunStatus::Success => {
-                        self.metrics
-                            .jobs_total
-                            .with_label_values(&["Success"])
-                            .inc();
-                    }
-                }
                 self.jobs
                     .finish(
                         job.id,
@@ -272,6 +229,14 @@ impl KafkaConsumer {
                     )
                     .await
                     .map_err(ProcessError::Retryable)?;
+                self.metrics
+                    .jobs_finished_total
+                    .with_label_values(&[&self.worker_id])
+                    .inc();
+                self.metrics
+                    .jobs_finished_by_status
+                    .with_label_values(&[res.status.as_str()])
+                    .inc();
             }
             Err(RunError::Cancelled) => {
                 tracing::warn!(
