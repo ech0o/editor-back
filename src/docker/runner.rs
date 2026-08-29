@@ -14,8 +14,8 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{ContainerInspectResponse, HostConfig, Mount};
 use bollard::query_parameters::{
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-    StopContainerOptions,
+    ListContainersOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::{
     Docker, models::ContainerCreateBody, query_parameters::CreateContainerOptionsBuilder,
@@ -33,6 +33,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Clone)]
 pub struct DockerRunner {
     docker: Arc<Docker>,
+    worker_id: String,
 }
 
 // #[derive(Serialize, Debug)]
@@ -42,8 +43,8 @@ pub struct DockerRunner {
 //     exit_code: i64,
 // }
 impl DockerRunner {
-    pub fn new(docker: Arc<Docker>) -> Self {
-        Self { docker }
+    pub fn new(docker: Arc<Docker>, worker_id: String) -> Self {
+        Self { docker, worker_id }
     }
 
     pub fn docker(&self) -> &Docker {
@@ -74,6 +75,12 @@ impl DockerRunner {
             ..Default::default()
         };
 
+        let label = HashMap::from([
+            ("app".to_string(), "code-runner".to_string()),
+            ("managed-by".to_string(), "worker".to_string()),
+            ("worker-id".to_string(), self.worker_id.clone()),
+        ]);
+
         let config = ContainerCreateBody {
             image: Some(image.to_owned()),
             cmd: Some(vec!["sleep".into(), "3600".into()]),
@@ -82,6 +89,7 @@ impl DockerRunner {
             attach_stderr: Some(true),
             open_stdin: Some(false),
             host_config: Some(host_config),
+            labels: Some(label),
             ..Default::default()
         };
 
@@ -117,106 +125,112 @@ impl DockerRunner {
         code: &str,
         cancel: CancellationToken,
     ) -> anyhow::Result<RunResponse, RunError> {
-        let workspace = Workspace::new().map_err(RunError::Other)?;
+        let workspace = Workspace::new(self.worker_id.as_str()).map_err(RunError::Other)?;
         workspace.write("main.rs", code)?;
-        self.with_container("rust:1.89", workspace.host_path(), cancel, |id| async move {
-            let compile = tokio::time::timeout(
-                COMPILE_TIMEOUT,
-                self.exec(
-                    &id,
-                    vec![
-                        "rustc".into(),
-                        "/workspace/main.rs".into(),
-                        "-o".into(),
-                        "/workspace/main".into(),
-                    ],
-                ),
-            )
-            .await;
-            let compile = match compile {
-                Ok(result) => result?,
-                Err(_) => {
-                    self.stop(&id).await?;
-                    return Ok(RunResponse {
-                        job_id,
-                        stdout: String::new(),
-                        status: RunStatus::TimeLimitExceeded,
-                        stderr: "compilation timed out".to_string(),
-                        exit_code: -1,
-                    });
-                }
-            };
-            let container = self.inspect_container(id.as_str()).await?;
-
-            let state = container
-                .state
-                .ok_or_else(|| anyhow!("container state is missing"))?;
-
-            if state.oom_killed.unwrap_or(false) {
-                return Ok(RunResponse {
-                    job_id,
-                    status: RunStatus::MemoryLimitExceeded,
-                    stdout: compile.stdout,
-                    stderr: compile.stderr,
-                    exit_code: compile.exit_code.unwrap_or(-1),
-                });
-            }
-            if compile.exit_code.unwrap() != 0 {
-                return Ok(RunResponse {
-                    job_id,
-                    status: RunStatus::CompileError,
-                    stdout: String::new(),
-                    stderr: compile.stderr,
-                    exit_code: compile.exit_code.unwrap_or(-1),
-                });
-            }
-            let res = timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspace/main".into()])).await;
-            tracing::info!(job_id=?job_id, result=?res, "finished exec");
-            match res {
-                Ok(result) => {
-                    let result = result?;
-                    let container = self.inspect_container(id.as_str()).await?;
-                    let state = container
-                        .state
-                        .ok_or_else(|| anyhow::anyhow!("container state is missing"))?;
-                    if state.oom_killed.unwrap_or(false) {
+        self.with_container(
+            "rust:1.89",
+            workspace.host_path(),
+            cancel,
+            |id| async move {
+                let compile = tokio::time::timeout(
+                    COMPILE_TIMEOUT,
+                    self.exec(
+                        &id,
+                        vec![
+                            "rustc".into(),
+                            "/workspace/main.rs".into(),
+                            "-o".into(),
+                            "/workspace/main".into(),
+                        ],
+                    ),
+                )
+                .await;
+                let compile = match compile {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        self.stop(&id).await?;
                         return Ok(RunResponse {
                             job_id,
-                            stdout: result.stdout,
-                            status: RunStatus::MemoryLimitExceeded,
-                            stderr: result.stderr,
-                            exit_code: result.exit_code.unwrap_or(-1),
+                            stdout: String::new(),
+                            status: RunStatus::TimeLimitExceeded,
+                            stderr: "compilation timed out".to_string(),
+                            exit_code: -1,
                         });
                     }
-                    let status = if result.exit_code.unwrap() == 0 {
-                        RunStatus::Success
-                    } else {
-                        RunStatus::RuntimeError
-                    };
-                    Ok(RunResponse {
+                };
+                let container = self.inspect_container(id.as_str()).await?;
+
+                let state = container
+                    .state
+                    .ok_or_else(|| anyhow!("container state is missing"))?;
+
+                if state.oom_killed.unwrap_or(false) {
+                    return Ok(RunResponse {
                         job_id,
-                        stdout: result.stdout,
-                        status,
-                        stderr: result.stderr,
-                        exit_code: result.exit_code.unwrap_or(-1),
-                    })
+                        status: RunStatus::MemoryLimitExceeded,
+                        stdout: compile.stdout,
+                        stderr: compile.stderr,
+                        exit_code: compile.exit_code.unwrap_or(-1),
+                    });
                 }
-                Err(_) => {
-                    if let Err(err) = self.stop(id.as_str()).await {
-                        tracing::warn!(container_id = %id,
+                if compile.exit_code.unwrap() != 0 {
+                    return Ok(RunResponse {
+                        job_id,
+                        status: RunStatus::CompileError,
+                        stdout: String::new(),
+                        stderr: compile.stderr,
+                        exit_code: compile.exit_code.unwrap_or(-1),
+                    });
+                }
+                let res =
+                    timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspace/main".into()])).await;
+                tracing::info!(job_id=?job_id, result=?res, "finished exec");
+                match res {
+                    Ok(result) => {
+                        let result = result?;
+                        let container = self.inspect_container(id.as_str()).await?;
+                        let state = container
+                            .state
+                            .ok_or_else(|| anyhow::anyhow!("container state is missing"))?;
+                        if state.oom_killed.unwrap_or(false) {
+                            return Ok(RunResponse {
+                                job_id,
+                                stdout: result.stdout,
+                                status: RunStatus::MemoryLimitExceeded,
+                                stderr: result.stderr,
+                                exit_code: result.exit_code.unwrap_or(-1),
+                            });
+                        }
+                        let status = if result.exit_code.unwrap() == 0 {
+                            RunStatus::Success
+                        } else {
+                            RunStatus::RuntimeError
+                        };
+                        Ok(RunResponse {
+                            job_id,
+                            stdout: result.stdout,
+                            status,
+                            stderr: result.stderr,
+                            exit_code: result.exit_code.unwrap_or(-1),
+                        })
+                    }
+                    Err(_) => {
+                        if let Err(err) = self.stop(id.as_str()).await {
+                            tracing::warn!(container_id = %id,
                         error = %err,
                         "failed to stop timed out container")
+                        }
+                        Ok(RunResponse {
+                            job_id,
+                            status: RunStatus::TimeLimitExceeded,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: -1,
+                        })
                     }
-                    Ok(RunResponse {
-                        job_id,
-                        status: RunStatus::TimeLimitExceeded,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: -1,
-                    })
                 }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -289,6 +303,34 @@ impl DockerRunner {
         if let Err(err) = self.cleanup_container(id).await {
             tracing::error!(container_id = %id,err=%err, "failed to cleanup container");
         }
+    }
+
+    pub async fn cleanup_orphans(&self) -> Result<()> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![
+                "app=code-runner".to_string(),
+                "managed-by=worker".to_string(),
+                format!("worker_id-{}", self.worker_id),
+            ],
+        )]);
+
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await?;
+
+        for container in containers {
+            if let Some(id) = container.id {
+                tracing::warn!(container_id = %id,worker_id=%self.worker_id,"removing orphan container");
+                let _=self.remove(&id).await;
+            }
+        }
+        Ok(())
     }
 }
 // mod test {
