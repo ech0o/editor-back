@@ -10,7 +10,7 @@ pub fn gather() -> String {
 }
 
 pub struct RunningGuard {
-    gauge: IntCounter,
+    gauge: Gauge,
 }
 
 pub struct Metrics {
@@ -18,16 +18,16 @@ pub struct Metrics {
     pub jobs_created_total: IntCounter,
     pub jobs_finished_total: IntCounterVec,
     pub jobs_failed_total: IntCounter,
-    pub jobs_running: IntCounter,
+    pub jobs_running: Gauge,
 
     pub job_duration_seconds: HistogramVec,
     pub job_queue_latency_seconds: Histogram,
-    pub jobs_total:IntCounterVec,
+    pub jobs_finished_by_status:IntCounterVec,
     pub registry: Registry,
 }
 
 impl RunningGuard {
-    pub fn new(gauge: IntCounter) -> Self {
+    pub fn new(gauge: Gauge) -> Self {
         gauge.inc();
         Self { gauge }
     }
@@ -53,7 +53,7 @@ impl Metrics {
             "Total number of jobs failed",
         )?;
 
-        let jobs_running=IntCounter::new(
+        let jobs_running=Gauge::new(
             "jobs_running",
             "Number of currently running jobs"
         )?;
@@ -67,9 +67,9 @@ impl Metrics {
             "Time a job waits before being processed by a worker"
         ))?;
 
-        let jobs_total = IntCounterVec::new(
+        let jobs_finished_by_status = IntCounterVec::new(
             Opts::new(
-                "jobs_total",
+                "jobs_finished_by_status",
                 "Total number of jobs processed",
             ),
             &["status"],
@@ -82,7 +82,7 @@ impl Metrics {
         registry.register(Box::new(jobs_failed_total.clone()))?;
         registry.register(Box::new(job_duration_seconds.clone()))?;
         registry.register(Box::new(job_queue_latency_seconds.clone()))?;
-        registry.register(Box::new(jobs_total.clone()))?;
+        registry.register(Box::new(jobs_finished_by_status.clone()))?;
         Ok(Self{
             worker_started_total,
             jobs_created_total,
@@ -91,7 +91,7 @@ impl Metrics {
             jobs_running,
             job_duration_seconds,
             job_queue_latency_seconds,
-            jobs_total,
+            jobs_finished_by_status,
             registry,
         })
 
@@ -100,7 +100,7 @@ impl Metrics {
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.gauge.desc();
+        self.gauge.dec();
     }
 }
 
