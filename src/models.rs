@@ -50,6 +50,21 @@ impl From<String> for RunStatus {
     }
 }
 
+
+impl RunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunStatus::Accepted => "Accepted",
+            RunStatus::CompileError => "CompileError",
+            RunStatus::RuntimeError => "RuntimeError",
+            RunStatus::TimeLimitExceeded => "TimeLimitExceeded",
+            RunStatus::MemoryLimitExceeded => "MemoryLimitExceeded",
+            RunStatus::Queued => "Queued",
+            RunStatus::Running => "Running",
+            RunStatus::Success => "Success",
+        }
+    }
+}
 impl Display for RunStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
