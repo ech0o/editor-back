@@ -1,12 +1,13 @@
 use crate::models::{RunResponse, RunStatus};
 use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
-use uuid::{ Uuid};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -19,6 +20,7 @@ pub struct Job {
     pub exit_code: Option<i32>,
     pub created_at: Option<DateTime<Utc>>,
     pub heartbeat_at: Option<DateTime<Utc>>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,7 +61,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
         Ok(())
     }
 
-    pub async fn try_start(&self, id: Uuid) -> anyhow::Result<Option<Uuid>> {
+    pub async fn try_start(&self, id: Uuid, worker_id: String) -> anyhow::Result<Option<Uuid>> {
         let token = Uuid::new_v4();
         let res = sqlx::query(
             r#"
@@ -68,7 +70,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
                 locked_at = NOW(),
                 lock_token = $2,
                 updated_at = NOW(),
-                heartbeat_at = NOW()
+                heartbeat_at = NOW(),
+                worker_id = $3
             WHERE id = $1
             AND (status = 'Queued'
                 OR (
@@ -82,6 +85,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
         )
         .bind(id)
         .bind(token)
+        .bind(worker_id)
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 1 {
@@ -91,7 +95,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
         }
     }
     pub async fn get_and_queued(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
-        let row = sqlx::query_as!(Job,
+        let row = sqlx::query_as!(
+            Job,
             r#"
         SELECT
             id,
@@ -99,13 +104,15 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             code,
             status,
             stdout,
+            worker_id,
             stderr,
             exit_code,
             created_at,
             heartbeat_at
         FROM jobs
         WHERE id = $1
-        "#,id
+        "#,
+            id
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -139,7 +146,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
     }
 
     pub async fn get(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
-        let row = sqlx::query(
+        let row = sqlx::query_as!(Job,
             r#"
         SELECT
             id,
@@ -147,41 +154,22 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             code,
             status,
             stdout,
+            worker_id,
             stderr,
-            exit_code
+            exit_code,
+            created_at,
+            heartbeat_at
         FROM jobs
         WHERE id = $1
-        "#,
+        "#,id
         )
-        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(row) = row else {
+        let Some(job) = row else {
             return Ok(None);
         };
 
-        let status = match row.try_get("status")? {
-            "Accepted" => RunStatus::Accepted,
-            "Queued" => RunStatus::Queued,
-            "Running" => RunStatus::Running,
-            "Success" => RunStatus::Success,
-            "CompileError" => RunStatus::CompileError,
-            "RuntimeError" => RunStatus::RuntimeError,
-            "TimeLimitExceeded" => RunStatus::TimeLimitExceeded,
-            "MemoryLimitExceeded" => RunStatus::MemoryLimitExceeded,
-            status => anyhow::bail!("unknown run status: {status}"),
-        };
-        let job = Job {
-            id: row.try_get("id")?,
-            language: row.try_get("language")?,
-            code: row.try_get("code")?,
-            status,
-            stdout: row.try_get("stdout")?,
-            stderr: row.try_get("stderr")?,
-            exit_code: row.try_get("exit_code")?,
-            created_at: None,
-            heartbeat_at: None,
-        };
+
         Ok(Some(job))
     }
     pub async fn update_status(&self, id: Uuid, status: RunStatus) -> anyhow::Result<()> {
@@ -208,7 +196,7 @@ SET status = $1 WHERE id = $2"#,
         stdout: Option<String>,
         stderr: Option<String>,
         exit_code: Option<i32>,
-        lock_token:Uuid
+        lock_token: Uuid,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             r#"
@@ -231,7 +219,7 @@ SET status = $1 WHERE id = $2"#,
         .bind(stderr)
         .bind(exit_code)
         .bind(id)
-            .bind(lock_token)
+        .bind(lock_token)
         .execute(&self.pool)
         .await?;
         tracing::info!(result = ?result,status=?status, "finish job status");
@@ -250,8 +238,8 @@ SET status = $1 WHERE id = $2"#,
                 updated_at = NOW(),
                 heartbeat_at = NOW()
             WHERE id = $1
-            AND  status = 'Running'
-            AND lock_token = $2
+                AND  status = 'Running'
+                AND lock_token = $2
         "#,
         )
         .bind(id)
@@ -259,5 +247,26 @@ SET status = $1 WHERE id = $2"#,
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)
+    }
+
+    pub async fn reap_stale_job(&self, timeout: Duration) -> anyhow::Result<Vec<Uuid>> {
+        let rows = sqlx::query!(
+            r#"
+            UPDATE jobs
+            SET
+                status = 'Queued',
+                worker_id = NULL,
+                lock_token = NULL,
+                heartbeat_at = NULL
+                WHERE
+                    status = 'Running'
+                    AND heartbeat_at = NOW() - ($1 * INTERVAL '1 seconds')
+                    RETURNING id
+               "#,
+            timeout.as_secs_f64(),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
     }
 }
