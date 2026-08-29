@@ -89,6 +89,7 @@ async fn run_handle(
         stderr: None,
         exit_code: None,
         created_at: None,
+        worker_id: None,
         heartbeat_at: None,
     };
     let job_id = job.id;
