@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use crate::workspace::Workspace;
 
 #[derive(Clone)]
 pub struct KafkaProducer {
@@ -264,6 +265,8 @@ impl KafkaConsumer {
     }
     pub async fn run(&self) -> anyhow::Result<()> {
         let mut stream = self.consumer.stream();
+        Workspace::cleanup_orphan(&self.worker_id)?;
+        self.runner.cleanup_orphans().await?;
         loop {
             tokio::select! {
                 biased;
