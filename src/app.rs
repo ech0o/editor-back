@@ -21,17 +21,18 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use crate::workspace::Workspace;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
-    let docker = Docker::connect_with_local_defaults()?;
-    let runner = DockerRunner::new(Arc::new(docker));
+    
     let db_addr = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:example@localhost:5432/postgres".to_string());
     println!("db_addr: {:?}", db_addr);
@@ -53,7 +54,7 @@ pub async fn create_app() -> anyhow::Result<()> {
         .merge(routes::router())
         .with_state(AppState::new(jobs.clone(), kafka.clone(), metrics.clone()));
     if args.get(1).map(String::as_str) == Some("worker") {
-        run_worker(jobs, kafka, runner, kafka_addr, metrics).await?;
+        run_worker(jobs, kafka, kafka_addr, metrics).await?;
     } else {
         run_api(router).await?;
     }
@@ -63,7 +64,6 @@ pub async fn create_app() -> anyhow::Result<()> {
 async fn run_worker(
     jobs: Arc<JobStore>,
     kafka: KafkaProducer,
-    docker_runner: DockerRunner,
     kafka_addr: String,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
@@ -72,12 +72,14 @@ async fn run_worker(
         .to_string_lossy()
         .into_owned();
     tracing::info!("initializing worker,{}", kafka_addr.as_str());
+    let docker = Docker::connect_with_local_defaults()?;
+    let docker_runner = DockerRunner::new(Arc::new(docker),worker_id.clone());
     let shutdown = CancellationToken::new();
     let consumer = KafkaConsumer::new(
         kafka_addr.as_str(),
         "judge-worker",
         docker_runner.clone(),
-        jobs,
+        jobs.clone(),
         kafka.producer.clone(),
         worker_id.as_str(),
         metrics.clone(),
@@ -97,6 +99,23 @@ async fn run_worker(
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+    tokio::spawn(async move {
+       let mut interval=tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop{
+            interval.tick().await;
+            match jobs.reap_stale_job(Duration::from_secs(30)).await{
+                Ok(ids)=>{
+                    for id in ids {
+                        tracing::warn!(job_id = %id, "reaped stale job");
+                    }
+                }
+                Err(e)=>{
+                    tracing::error!(err = %e, "failed to reaped stale job");
+                }
+            }
+        }
+    });
+
     let consumer_task = tokio::spawn(async move {
         consumer.subscribe()?;
         consumer.run().await
