@@ -57,9 +57,15 @@ impl DockerRunner {
 
     pub async fn create(&self, image: &str, workspace: &Path) -> Result<String> {
         self.pull_if_needed(image).await?;
+        let main_rs = workspace.join("main.rs");
 
+        tracing::info!(
+            path = %main_rs.display(),
+            exists = main_rs.exists(),
+            "checking workspace"
+        );
         let host_config = HostConfig {
-            binds: Some(vec![format!("{}:/workspace", workspace.to_string_lossy())]),
+            binds: Some(vec![format!("{}:/workspaces", workspace.to_string_lossy())]),
             memory: Some(128 * 1024 * 1024),
             memory_swap: Some(128 * 1024 * 1024),
             nano_cpus: Some(500_000_000),
@@ -126,21 +132,23 @@ impl DockerRunner {
         cancel: CancellationToken,
     ) -> anyhow::Result<RunResponse, RunError> {
         let workspace = Workspace::new(self.worker_id.as_str()).map_err(RunError::Other)?;
-        workspace.write("main.rs", code)?;
+        workspace.write("main.rs", code).map_err(RunError::Other)?;
         self.with_container(
             "rust:1.89",
             workspace.host_path(),
             cancel,
             |id| async move {
+                // let res =self.exec(&id,vec!["ls".into(),"/workspaces".into()]).await?;
+                // tracing::info!(result=?res,"workspace result");
                 let compile = tokio::time::timeout(
                     COMPILE_TIMEOUT,
                     self.exec(
                         &id,
                         vec![
                             "rustc".into(),
-                            "/workspace/main.rs".into(),
+                            "/workspaces/main.rs".into(),
                             "-o".into(),
-                            "/workspace/main".into(),
+                            "/workspaces/main".into(),
                         ],
                     ),
                 )
@@ -183,7 +191,7 @@ impl DockerRunner {
                     });
                 }
                 let res =
-                    timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspace/main".into()])).await;
+                    timeout(RUN_TIMEOUT, self.exec(&id, vec!["/workspaces/main".into()])).await;
                 tracing::info!(job_id=?job_id, result=?res, "finished exec");
                 match res {
                     Ok(result) => {
