@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE job_outbox\n            SET published_at = NOW()\n            WHERE id = $1\n                AND published_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dc700b6e0f915f7cb4b92ddb66e97a231cb56a4a8fb41289ee0722b40f71335b"
+}

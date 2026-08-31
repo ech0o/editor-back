@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n           WITH reaped AS (\n           UPDATE jobs\n            SET\n                status = 'Queued',\n                worker_id = NULL,\n                lock_token = NULL,\n                heartbeat_at = NULL\n                WHERE\n                    status = 'Running'\n                    AND heartbeat_at < NOW() - ($1 * INTERVAL '1 seconds')\n                    RETURNING id\n            )\n           INSERT INTO job_outbox (\n                id,\n                job_id,\n                event_type\n           )\n           SELECT\n               gen_random_uuid(),\n               id,\n               'job.execute'\n           FROM reaped\n           RETURNING job_id\n               ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "job_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e8e3f60b10c1f64f5e48adf21d76dcaca21be4bbb233415e77d95c5ed3bfd422"
+}
