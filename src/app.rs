@@ -2,10 +2,13 @@ use crate::apierror::ErrorResponse;
 use crate::db::Database;
 use crate::docker::DockerRunner;
 use crate::job::{Job, JobStore};
+use crate::joboutbox::OutboxPublisher;
 use crate::kafka::{KafkaConsumer, KafkaProducer};
 use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
+use crate::reaper::Reaper;
 use crate::state::JobState;
+use crate::workspace::Workspace;
 use crate::{routes, state::AppState};
 use axum::Router;
 use axum::http::{HeaderValue, Method};
@@ -28,11 +31,10 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use crate::workspace::Workspace;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
-    
+
     let db_addr = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:example@localhost:5432/postgres".to_string());
     println!("db_addr: {:?}", db_addr);
@@ -73,7 +75,7 @@ async fn run_worker(
         .into_owned();
     tracing::info!("initializing worker,{}", kafka_addr.as_str());
     let docker = Docker::connect_with_local_defaults()?;
-    let docker_runner = DockerRunner::new(Arc::new(docker),worker_id.clone());
+    let docker_runner = DockerRunner::new(Arc::new(docker), worker_id.clone());
     let shutdown = CancellationToken::new();
     let consumer = KafkaConsumer::new(
         kafka_addr.as_str(),
@@ -99,20 +101,30 @@ async fn run_worker(
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
+    let producer = Arc::new(kafka);
+    let reaper = Reaper::new(jobs.clone(), producer.clone());
     tokio::spawn(async move {
-       let mut interval=tokio::time::interval(tokio::time::Duration::from_secs(10));
-        loop{
-            interval.tick().await;
-            match jobs.reap_stale_job(Duration::from_secs(30)).await{
-                Ok(ids)=>{
-                    for id in ids {
-                        tracing::warn!(job_id = %id, "reaped stale job");
-                    }
-                }
-                Err(e)=>{
-                    tracing::error!(err = %e, "failed to reaped stale job");
-                }
-            }
+        // let mut interval=tokio::time::interval(tokio::time::Duration::from_secs(10));
+        //  loop{
+        //      interval.tick().await;
+        //      match jobs.reap_stale_job(Duration::from_secs(30)).await{
+        //          Ok(ids)=>{
+        //              for id in ids {
+        //                  tracing::warn!(job_id = %id, "reaped stale job");
+        //              }
+        //          }
+        //          Err(e)=>{
+        //              tracing::error!(err = %e, "failed to reaped stale job");
+        //          }
+        //      }
+        //  }
+        let _ = reaper.run().await;
+    });
+
+    let outbox_publisher = OutboxPublisher::new(jobs.clone(), producer);
+    tokio::spawn(async move {
+        if let Err(err) = outbox_publisher.run().await {
+            tracing::error!(err=%err,"outbox_publisher stopped");
         }
     });
 

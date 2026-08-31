@@ -11,6 +11,8 @@ mod models;
 mod state;
 mod workspace;
 mod metrics;
+mod reaper;
+mod joboutbox;
 
 use tokio::net::TcpListener;
 

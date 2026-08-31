@@ -1,3 +1,4 @@
+use crate::joboutbox::JobOutbox;
 use crate::models::{RunResponse, RunStatus};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
@@ -146,7 +147,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
     }
 
     pub async fn get(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
-        let row = sqlx::query_as!(Job,
+        let row = sqlx::query_as!(
+            Job,
             r#"
         SELECT
             id,
@@ -161,14 +163,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
             heartbeat_at
         FROM jobs
         WHERE id = $1
-        "#,id
+        "#,
+            id
         )
         .fetch_optional(&self.pool)
         .await?;
         let Some(job) = row else {
             return Ok(None);
         };
-
 
         Ok(Some(job))
     }
@@ -252,7 +254,8 @@ SET status = $1 WHERE id = $2"#,
     pub async fn reap_stale_job(&self, timeout: Duration) -> anyhow::Result<Vec<Uuid>> {
         let rows = sqlx::query!(
             r#"
-            UPDATE jobs
+           WITH reaped AS (
+           UPDATE jobs
             SET
                 status = 'Queued',
                 worker_id = NULL,
@@ -260,13 +263,62 @@ SET status = $1 WHERE id = $2"#,
                 heartbeat_at = NULL
                 WHERE
                     status = 'Running'
-                    AND heartbeat_at = NOW() - ($1 * INTERVAL '1 seconds')
+                    AND heartbeat_at < NOW() - ($1 * INTERVAL '1 seconds')
                     RETURNING id
+            )
+           INSERT INTO job_outbox (
+                id,
+                job_id,
+                event_type
+           )
+           SELECT
+               gen_random_uuid(),
+               id,
+               'job.execute'
+           FROM reaped
+           RETURNING job_id
                "#,
             timeout.as_secs_f64(),
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|row| row.id).collect())
+        Ok(rows.into_iter().map(|row| row.job_id).collect())
+    }
+
+    pub async fn get_unpublished_outbox(&self, limit: i64) -> anyhow::Result<Vec<JobOutbox>> {
+        let rows = sqlx::query_as!(
+            JobOutbox,
+            r#"
+                SELECT
+                    id,
+                    job_id,
+                    event_type,
+                    created_at,
+                    published_at
+                FROM job_outbox
+                WHERE published_at IS NULL
+                ORDER BY created_at
+                LIMIT $1
+                "#,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn mark_outbox_published(&self, id: Uuid) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE job_outbox
+            SET published_at = NOW()
+            WHERE id = $1
+                AND published_at IS NULL
+            "#,
+            id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
