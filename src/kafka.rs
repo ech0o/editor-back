@@ -265,8 +265,8 @@ impl KafkaConsumer {
     }
     pub async fn run(&self) -> anyhow::Result<()> {
         let mut stream = self.consumer.stream();
-        Workspace::cleanup_orphan(&self.worker_id)?;
-        self.runner.cleanup_orphans().await?;
+        // Workspace::cleanup_orphan(&self.worker_id)?;
+        self.runner.clean_orphan_containers(&self.jobs).await?;
         loop {
             tokio::select! {
                 biased;

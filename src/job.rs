@@ -321,4 +321,20 @@ SET status = $1 WHERE id = $2"#,
         .await?;
         Ok(())
     }
+
+
+    pub async fn is_job_execution_alive(&self,job_id:Uuid) -> anyhow::Result<bool> {
+        let row = sqlx::query!(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM jobs
+    WHERE id = $1
+        AND status = 'Running'
+        AND heartbeat_at >= NOW() - INTERVAL '30 seconds'
+)AS "alive!"
+            "#,job_id
+        ).fetch_one(&self.pool).await?;
+        Ok(row.alive)
+    }
 }

@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::docker::image::pull_if_needed;
-use crate::docker::workspace::{create_workspace, write_source};
 use crate::error::RunError;
+use crate::job::JobStore;
 use crate::models::{ExecResult, RunResponse, RunStatus};
 use crate::workspace::Workspace;
 use anyhow::{Result, anyhow};
@@ -14,8 +14,8 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{ContainerInspectResponse, HostConfig, Mount};
 use bollard::query_parameters::{
-    ListContainersOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    StartContainerOptions, StopContainerOptions,
+    ListContainersOptions, ListContainersOptionsBuilder, RemoveContainerOptions,
+    RemoveContainerOptionsBuilder, StartContainerOptions, StopContainerOptions,
 };
 use bollard::{
     Docker, models::ContainerCreateBody, query_parameters::CreateContainerOptionsBuilder,
@@ -55,7 +55,7 @@ impl DockerRunner {
         pull_if_needed(self.docker(), image).await
     }
 
-    pub async fn create(&self, image: &str, workspace: &Path) -> Result<String> {
+    pub async fn create(&self, image: &str, workspace: &Path, job_id: Uuid) -> Result<String> {
         self.pull_if_needed(image).await?;
         let main_rs = workspace.join("main.rs");
 
@@ -84,7 +84,8 @@ impl DockerRunner {
         let label = HashMap::from([
             ("app".to_string(), "code-runner".to_string()),
             ("managed-by".to_string(), "worker".to_string()),
-            ("worker-id".to_string(), self.worker_id.clone()),
+            ("oj.worker_id".to_string(), self.worker_id.clone()),
+            ("oj.job_id".to_string(), job_id.to_string()),
         ]);
 
         let config = ContainerCreateBody {
@@ -104,7 +105,12 @@ impl DockerRunner {
             .build();
 
         let response = self.docker.create_container(Some(options), config).await?;
+        let inspect = self.docker.inspect_container(&response.id, None).await?;
 
+        tracing::info!(
+            labels = ?inspect.config.and_then(|c| c.labels),
+            "code container labels"
+        );
         Ok(response.id)
     }
 
@@ -137,6 +143,7 @@ impl DockerRunner {
             "rust:1.89",
             workspace.host_path(),
             cancel,
+            job_id,
             |id| async move {
                 // let res =self.exec(&id,vec!["ls".into(),"/workspaces".into()]).await?;
                 // tracing::info!(result=?res,"workspace result");
@@ -252,6 +259,7 @@ impl DockerRunner {
         image: &str,
         workspace: &Path,
         cancel: CancellationToken,
+        job_id: Uuid,
         f: F,
     ) -> Result<RunResponse, RunError>
     where
@@ -259,7 +267,7 @@ impl DockerRunner {
         Fut: Future<Output = anyhow::Result<RunResponse, RunError>>,
     {
         let id = self
-            .create(image, workspace)
+            .create(image, workspace, job_id)
             .await
             .map_err(RunError::Other)?;
         self.start(id.as_str()).await.map_err(RunError::Other)?;
@@ -313,31 +321,114 @@ impl DockerRunner {
         }
     }
 
-    pub async fn cleanup_orphans(&self) -> Result<()> {
-        let filters = HashMap::from([(
-            "label".to_string(),
-            vec![
-                "app=code-runner".to_string(),
-                "managed-by=worker".to_string(),
-                format!("worker_id-{}", self.worker_id),
-            ],
-        )]);
+    // pub async fn cleanup_orphans(&self) -> Result<()> {
+    //     let filters = HashMap::from([(
+    //         "label".to_string(),
+    //         vec![
+    //             "app=code-runner".to_string(),
+    //             "managed-by=worker".to_string(),
+    //             format!("worker_id-{}", self.worker_id),
+    //         ],
+    //     )]);
+    // 
+    //     let containers = self
+    //         .docker
+    //         .list_containers(Some(ListContainersOptions {
+    //             all: true,
+    //             filters: Some(filters),
+    //             ..Default::default()
+    //         }))
+    //         .await?;
+    // 
+    //     for container in containers {
+    //         if let Some(id) = container.id {
+    //             tracing::warn!(container_id = %id,worker_id=%self.worker_id,"removing orphan container");
+    //             let _ = self.remove(&id).await;
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
+
+    pub async fn list_code_containers(&self) -> Result<Vec<(String, Uuid)>> {
         let containers = self
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: Some(filters),
+                filters: Some(HashMap::from([(
+                    "label".to_string(),
+                    vec!["managed-by=worker".to_string()],
+                )])),
                 ..Default::default()
             }))
             .await?;
 
+        let mut result = Vec::new();
         for container in containers {
-            if let Some(id) = container.id {
-                tracing::warn!(container_id = %id,worker_id=%self.worker_id,"removing orphan container");
-                let _=self.remove(&id).await;
+            let Some(id) = container.id else {
+                continue;
+            };
+            let Some(labels) = container.labels else {
+                continue;
+            };
+
+            let Some(job_id) = labels
+                .get("oj.job_id")
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                tracing::warn!(
+                    container_id = %id,
+                    "code container has invalid job_id"
+                );
+                continue;
+            };
+
+            result.push((id, job_id));
+        }
+        Ok(result)
+    }
+
+    pub async fn clean_orphan_containers(&self, jobs: &JobStore) -> anyhow::Result<()> {
+        let containers = self.list_code_containers().await?;
+
+        for (container_id, job_id) in containers {
+            let alive = jobs.is_job_execution_alive(job_id).await?;
+            if alive {
+                tracing::debug!(
+                    container_id = %container_id,
+                    %job_id,
+                    "code container is still active"
+                );
+
+                continue;
+            }
+
+            tracing::warn!(
+                container_id = %container_id,
+                %job_id,
+                "removing orphan code container"
+            );
+
+            if let Err(error) = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                tracing::error!(
+                    container_id = %container_id,
+                    %job_id,
+                    ?error,
+                    "failed to remove orphan code container"
+                );
             }
         }
+
         Ok(())
     }
 }
