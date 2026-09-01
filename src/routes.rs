@@ -1,6 +1,5 @@
 use crate::apierror::ApiError;
 use crate::docker::exec::ExecResult;
-use crate::docker::workspace::{create_workspace, write_source};
 use crate::job::Job;
 use crate::metrics::Metrics;
 use crate::models::{JobIdResponse, JobMessage, JobResponse, RunRequest, RunResponse, RunStatus};
