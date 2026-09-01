@@ -60,28 +60,28 @@ impl Workspace {
         Ok(())
     }
 
-    pub fn cleanup_orphan(worker_id: &str) -> anyhow::Result<()> {
-        let host_root = std::env::var("WORKSPACE_HOST_ROOT")?;
-        let working_dir = PathBuf::from(host_root).join(worker_id);
-        if !working_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(working_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                tracing::warn!(path = %path.display(), "removing orphan workspace");
-
-                if let Err(e) = fs::remove_dir_all(&path) {
-                    tracing::error!(path = %path.display(),
-                        error = %e,
-                        "failed to remove orphan workspace");
-                }
-            }
-        }
-        Ok(())
-    }
+    // pub fn cleanup_orphan(worker_id: &str) -> anyhow::Result<()> {
+    //     let host_root = std::env::var("WORKSPACE_HOST_ROOT")?;
+    //     let working_dir = PathBuf::from(host_root).join(worker_id);
+    //     if !working_dir.exists() {
+    //         return Ok(());
+    //     }
+    //     for entry in fs::read_dir(working_dir)? {
+    //         let entry = entry?;
+    //         let path = entry.path();
+    //
+    //         if path.is_dir() {
+    //             tracing::warn!(path = %path.display(), "removing orphan workspace");
+    //
+    //             if let Err(e) = fs::remove_dir_all(&path) {
+    //                 tracing::error!(path = %path.display(),
+    //                     error = %e,
+    //                     "failed to remove orphan workspace");
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
 }
 
 impl Drop for Workspace {
