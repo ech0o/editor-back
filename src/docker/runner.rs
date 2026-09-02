@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::fs;
 use std::fs::remove_dir_all;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::docker::image::pull_if_needed;
@@ -8,7 +9,7 @@ use crate::error::RunError;
 use crate::job::JobStore;
 use crate::models::{ExecResult, RunResponse, RunStatus};
 use crate::workspace::Workspace;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use bollard::config::MountType;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
@@ -55,15 +56,16 @@ impl DockerRunner {
         pull_if_needed(self.docker(), image).await
     }
 
-    pub async fn create(&self, image: &str, workspace: &Path, job_id: Uuid) -> Result<String> {
+    pub async fn create(&self, image: &str, workspace: &Path, job_id: Uuid,temp_path:String) -> Result<String> {
         self.pull_if_needed(image).await?;
         let main_rs = workspace.join("main.rs");
 
-        tracing::info!(
+        tracing::debug!(
             path = %main_rs.display(),
             exists = main_rs.exists(),
             "checking workspace"
         );
+        // tracing::info!(path=%temp_path,"checking tmp:");
         let host_config = HostConfig {
             binds: Some(vec![format!("{}:/workspaces", workspace.to_string_lossy())]),
             memory: Some(128 * 1024 * 1024),
@@ -86,6 +88,10 @@ impl DockerRunner {
             ("managed-by".to_string(), "worker".to_string()),
             ("oj.worker_id".to_string(), self.worker_id.clone()),
             ("oj.job_id".to_string(), job_id.to_string()),
+            (
+                "oj.workspace".to_string(),
+                temp_path,
+            ),
         ]);
 
         let config = ContainerCreateBody {
@@ -144,6 +150,7 @@ impl DockerRunner {
             workspace.host_path(),
             cancel,
             job_id,
+            workspace.path().to_string_lossy().into_owned(),
             |id| async move {
                 // let res =self.exec(&id,vec!["ls".into(),"/workspaces".into()]).await?;
                 // tracing::info!(result=?res,"workspace result");
@@ -260,6 +267,7 @@ impl DockerRunner {
         workspace: &Path,
         cancel: CancellationToken,
         job_id: Uuid,
+        temp_path:String,
         f: F,
     ) -> Result<RunResponse, RunError>
     where
@@ -267,7 +275,7 @@ impl DockerRunner {
         Fut: Future<Output = anyhow::Result<RunResponse, RunError>>,
     {
         let id = self
-            .create(image, workspace, job_id)
+            .create(image, workspace, job_id, temp_path)
             .await
             .map_err(RunError::Other)?;
         self.start(id.as_str()).await.map_err(RunError::Other)?;
@@ -330,7 +338,7 @@ impl DockerRunner {
     //             format!("worker_id-{}", self.worker_id),
     //         ],
     //     )]);
-    // 
+    //
     //     let containers = self
     //         .docker
     //         .list_containers(Some(ListContainersOptions {
@@ -339,7 +347,7 @@ impl DockerRunner {
     //             ..Default::default()
     //         }))
     //         .await?;
-    // 
+    //
     //     for container in containers {
     //         if let Some(id) = container.id {
     //             tracing::warn!(container_id = %id,worker_id=%self.worker_id,"removing orphan container");
@@ -348,7 +356,6 @@ impl DockerRunner {
     //     }
     //     Ok(())
     // }
-
 
     pub async fn list_code_containers(&self) -> Result<Vec<(String, Uuid)>> {
         let containers = self
@@ -394,7 +401,7 @@ impl DockerRunner {
         for (container_id, job_id) in containers {
             let alive = jobs.is_job_execution_alive(job_id).await?;
             if alive {
-                tracing::debug!(
+                tracing::info!(
                     container_id = %container_id,
                     %job_id,
                     "code container is still active"
@@ -407,6 +414,26 @@ impl DockerRunner {
                 container_id = %container_id,
                 %job_id,
                 "removing orphan code container"
+            );
+
+            let workspace = match self.get_workspace_from_container(&container_id).await {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::error!(
+                        container_id=%container_id,
+                        %job_id,
+                        ?error,
+                        "failed to get worksapce from container"
+                    );
+                    None
+                }
+            };
+            let a = workspace.as_ref().unwrap();
+            let path = a.as_path();
+            tracing::info!(
+                path = %path.display(),
+                exists= path.exists(),
+                "workspace before container removal"
             );
 
             if let Err(error) = self
@@ -427,9 +454,101 @@ impl DockerRunner {
                     "failed to remove orphan code container"
                 );
             }
+
+            tracing::info!(
+                path = %path.display(),
+                exists= path.exists(),
+                "workspace after container removal"
+            );
+
+            if let Some(workspace) = workspace {
+                // if let Err(err) = fs::remove_dir_all(&workspace) {
+                //     tracing::error!(
+                //         workspace=%workspace.display(),
+                //         %job_id,
+                //         ?err,
+                //         "failed to remove orphan code workspace"
+                //     )
+                // } else {
+                //     tracing::info!(
+                //         workspace=%workspace.display(),
+                //         %job_id,
+                //         "removed orphan code workspace"
+                //     );
+                // }
+                tracing::info!(
+                    path = %workspace.display(),
+                    "calling remove_workspace"
+                );
+                Self::remove_workspace(&workspace).await;
+            }
         }
 
         Ok(())
+    }
+
+    async fn remove_workspace(path: &PathBuf) {
+        for attempt in 0..5 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => {
+                    tracing::info!(
+                        workspace = %path.display(),
+                        "removed orphan workspace"
+                    );
+                    return;
+                }
+                Err(error) if error.raw_os_error() == Some(16) => {
+                    tracing::debug!(
+                        workspace = %path.display(),
+                        attempt,
+                        "workspace is still busy, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(200)).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        workspace = %path.display(),
+                        ?error,
+                        "failed to remove orphan workspace"
+                    );
+                    return;
+                }
+            }
+        }
+        tracing::error!(workspace = %path.display(),"workspace is still busy after retries");
+    }
+
+    async fn get_workspace_from_container(&self, container_id: &str) -> Result<Option<PathBuf>> {
+        let container = self.docker.inspect_container(container_id, None).await?;
+
+        let Some(config) = container.config else {
+            return Ok(None);
+        };
+        let Some(labels) = config.labels else {
+            tracing::warn!(container_id = %container_id,"orphan container does not have a label");
+            return Ok(None);
+        };
+        let workspace = labels.get("oj.workspace").map(PathBuf::from);
+        // if mount.destination.as_deref() != Some("/workspaces") {
+        //     continue;
+        // }
+        //
+        // let workspace_root = PathBuf::from(std::env::var("WORKSPACE_HOST_ROOT")?);
+        //
+        // let Some(source) = mount.source else { continue };
+        // let source = PathBuf::from(source);
+        // let workspace = source
+        //     .parent()
+        //     .ok_or_else(|| anyhow!("workspace has no parent directory"))?
+        //     .to_path_buf();
+        // if !workspace.starts_with(&workspace_root) {
+        //     bail!(
+        //         "workspace {} is outside workspace root {}",
+        //         workspace.display(),
+        //         workspace_root.display()
+        //     )
+        // }
+        Ok(workspace)
     }
 }
 // mod test {

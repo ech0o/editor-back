@@ -16,13 +16,6 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(worker_id: &str) -> Result<Self> {
-        // let host_root = std::env::var("WORKSPACE_HOST_ROOT")?;
-        // let worker_dir = PathBuf::from(host_root).join(worker_id);
-        // fs::create_dir_all(&worker_dir)?;
-        // let path = worker_dir.join(Uuid::new_v4().to_string());
-        // fs::create_dir(&path)?;
-        // tracing::info!("Workspace directory created at {:?}", path);
-        // Ok(Self { host_path: path })
         let path = format!("/workspaces/{}", worker_id);
         if !Path::new(&path).is_dir() {
             DirBuilder::new()
@@ -60,34 +53,15 @@ impl Workspace {
         Ok(())
     }
 
-    // pub fn cleanup_orphan(worker_id: &str) -> anyhow::Result<()> {
-    //     let host_root = std::env::var("WORKSPACE_HOST_ROOT")?;
-    //     let working_dir = PathBuf::from(host_root).join(worker_id);
-    //     if !working_dir.exists() {
-    //         return Ok(());
-    //     }
-    //     for entry in fs::read_dir(working_dir)? {
-    //         let entry = entry?;
-    //         let path = entry.path();
-    //
-    //         if path.is_dir() {
-    //             tracing::warn!(path = %path.display(), "removing orphan workspace");
-    //
-    //             if let Err(e) = fs::remove_dir_all(&path) {
-    //                 tracing::error!(path = %path.display(),
-    //                     error = %e,
-    //                     "failed to remove orphan workspace");
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        tracing::info!("Cleaning up:{:?}",self.root_path);
-        if let Err(err) = fs::remove_dir_all(&self.root_path) {
+        tracing::info!(
+            "Cleaning up: {:?}",
+            self.dir.path()
+        );
+        if let Err(err) = fs::remove_dir_all(&self.dir.path()) {
             tracing::warn!(error = %err, "failed to remove workspace");
         };
     }
