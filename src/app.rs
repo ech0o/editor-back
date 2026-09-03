@@ -3,7 +3,7 @@ use crate::db::Database;
 use crate::docker::DockerRunner;
 use crate::job::{Job, JobStore};
 use crate::joboutbox::OutboxPublisher;
-use crate::kafka::{KafkaConsumer, KafkaProducer};
+use crate::kafka::{KafkaConfig, KafkaConsumer, KafkaProducer};
 use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
 use crate::reaper::Reaper;
@@ -31,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use crate::worker::{WorkerContext};
+use crate::worker::pool::WorkerPool;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -77,24 +79,33 @@ async fn run_worker(
     let docker = Docker::connect_with_local_defaults()?;
     let docker_runner = DockerRunner::new(Arc::new(docker), worker_id.clone());
     let shutdown = CancellationToken::new();
-    let consumer = KafkaConsumer::new(
-        kafka_addr.as_str(),
-        "judge-worker",
-        docker_runner.clone(),
-        jobs.clone(),
-        kafka.producer.clone(),
-        worker_id.as_str(),
-        metrics.clone(),
-        shutdown.clone(),
-    )?;
+    let kafka_config = KafkaConfig{
+        broker:  kafka_addr,
+        group_id: String::from("judge-worker"),
+    };
+    let ctx = WorkerContext {
+        producer: kafka.producer.clone(),
+        runner: Arc::new(docker_runner),
+        metrics: metrics.clone(),
+        jobs: jobs.clone(),
+    };
+
+    // let consumer = KafkaConsumer::new(
+    //     worker_id.as_str(),
+    //     &kafka_config,
+    //     ctx,
+    //     shutdown.clone(),
+    // )?;
+    let mut pool=WorkerPool::new(kafka_config,ctx);
+    pool.start(3).await;
     metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
     tracing::info!("Listening on http://0.0.0.0:9091");
-    tracing::info!(
-        worker_id = worker_id,
-        pid = std::process::id(),
-        "worker started"
-    );
+    // tracing::info!(
+    //     worker_id = worker_id,
+    //     pid = std::process::id(),
+    //     "worker started"
+    // );
     let router = Router::new()
         .merge(routes::worker_router())
         .with_state(metrics);
@@ -128,14 +139,14 @@ async fn run_worker(
         }
     });
 
-    let consumer_task = tokio::spawn(async move {
-        consumer.subscribe()?;
-        consumer.run().await
-    });
+    // let consumer_task = tokio::spawn(async move {
+    //     consumer.subscribe()?;
+    //     consumer.run().await
+    // });
     shutdown_signal().await;
     tracing::info!("shutdown signal received");
     shutdown.cancel();
-    consumer_task.await??;
+    // consumer_task.await??;
     Ok(())
 }
 async fn run_api(

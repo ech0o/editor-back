@@ -3,6 +3,8 @@ use crate::error::{ProcessError, RunError};
 use crate::job::{Job, JobStore};
 use crate::metrics::{Metrics, RunningGuard, job_completed, job_duration, job_failed};
 use crate::models::{DlqMessage, JobMessage, RunStatus};
+use crate::worker::WorkerContext;
+use crate::workspace::Workspace;
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -16,7 +18,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use crate::workspace::Workspace;
 
 #[derive(Clone)]
 pub struct KafkaProducer {
@@ -27,10 +28,28 @@ pub struct KafkaConsumer {
     worker_id: String,
     consumer: StreamConsumer,
     producer: FutureProducer,
-    runner: DockerRunner,
+    runner: Arc<DockerRunner>,
     jobs: Arc<JobStore>,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
+}
+
+#[derive(Clone)]
+pub struct KafkaConfig {
+    pub broker: String,
+    pub group_id: String,
+}
+
+impl KafkaConfig {
+    pub fn create_consumer(&self) -> anyhow::Result<StreamConsumer> {
+        let consumer = ClientConfig::new()
+            .set("group.id", &self.group_id)
+            .set("bootstrap.servers", &self.broker)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+        Ok(consumer)
+    }
 }
 
 impl KafkaProducer {
@@ -59,28 +78,19 @@ impl KafkaProducer {
 
 impl KafkaConsumer {
     pub fn new(
-        broker: &str,
-        group_id: &str,
-        runner: DockerRunner,
-        jobs: Arc<JobStore>,
-        producer: FutureProducer,
         worker_id: &str,
-        metrics: Arc<Metrics>,
+        kafka: &KafkaConfig,
+        ctx: WorkerContext,
         shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", broker)
-            .set("group.id", group_id)
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .create()?;
+        let consumer = kafka.create_consumer()?;
         Ok(Self {
             consumer,
-            runner,
-            jobs,
-            producer,
+            runner: ctx.runner,
+            jobs: ctx.jobs,
+            producer: ctx.producer,
             worker_id: String::from(worker_id),
-            metrics,
+            metrics: ctx.metrics,
             shutdown,
         })
     }
@@ -276,6 +286,7 @@ impl KafkaConsumer {
                     break;
                 }
                 message = stream.next() => {
+                    tracing::info!("consumer running message");
                     let Some(message) = message else{
                         break;
                     };

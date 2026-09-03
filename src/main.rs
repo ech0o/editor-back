@@ -13,6 +13,7 @@ mod workspace;
 mod metrics;
 mod reaper;
 mod joboutbox;
+mod worker;
 
 use tokio::net::TcpListener;
 
