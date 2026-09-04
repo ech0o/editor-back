@@ -6,6 +6,7 @@ use crate::worker::workspace::WorkerWorkspace;
 use rdkafka::producer::FutureProducer;
 use std::sync::Arc;
 use std::time::Duration;
+use anyhow::Error;
 use tokio_util::sync::CancellationToken;
 
 pub mod pool;
@@ -36,7 +37,6 @@ impl Worker {
         let shutdown = CancellationToken::new();
 
         let consumer = KafkaConsumer::new(&worker_id, &kafka_config, ctx, shutdown.clone())?;
-
         Ok(Self {
             worker_id,
             workspace,
@@ -47,13 +47,17 @@ impl Worker {
 
     pub async fn run(self) -> anyhow::Result<()> {
         tracing::info!(
-        worker_id = %self.worker_id,
-        pid = std::process::id(),
-        "worker started"
-    );
+            worker_id = %self.worker_id,
+            pid = std::process::id(),
+            "worker started"
+        );
         self.consumer.subscribe()?;
         self.consumer.run().await?;
 
         Ok(())
+    }
+    
+    pub fn shutdown(&self)->&CancellationToken {
+        &self.shutdown
     }
 }
