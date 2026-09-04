@@ -96,7 +96,7 @@ async fn run_worker(
     //     ctx,
     //     shutdown.clone(),
     // )?;
-    let mut pool=WorkerPool::new(kafka_config,ctx);
+    let mut pool = WorkerPool::new(kafka_config,ctx,shutdown.clone());
     pool.start(3).await;
     metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
@@ -146,6 +146,7 @@ async fn run_worker(
     shutdown_signal().await;
     tracing::info!("shutdown signal received");
     shutdown.cancel();
+    pool.shutdown().await;
     // consumer_task.await??;
     Ok(())
 }
