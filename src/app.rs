@@ -8,6 +8,8 @@ use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
 use crate::reaper::Reaper;
 use crate::state::{JobState, WorkerState};
+use crate::worker::WorkerContext;
+use crate::worker::pool::WorkerPool;
 use crate::workspace::Workspace;
 use crate::{routes, state::AppState};
 use axum::Router;
@@ -31,8 +33,6 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use crate::worker::{WorkerContext};
-use crate::worker::pool::WorkerPool;
 
 pub async fn create_app() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -49,19 +49,10 @@ pub async fn create_app() -> anyhow::Result<()> {
     let jobs = Arc::new(JobStore::new(db));
     let metrics = Arc::new(Metrics::new()?);
 
-    let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
-        .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers(Any);
-    let router = Router::new()
-        .layer(RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(cors)
-        .merge(routes::router())
-        .with_state(AppState::new(jobs.clone(), kafka.clone(), metrics.clone()));
     if args.get(1).map(String::as_str) == Some("worker") {
         run_worker(jobs, kafka, kafka_addr, metrics).await?;
     } else {
-        run_api(router).await?;
+        run_api(jobs.clone(), kafka.clone(), metrics.clone()).await?;
     }
     Ok(())
 }
@@ -80,8 +71,8 @@ async fn run_worker(
     let docker = Docker::connect_with_local_defaults()?;
     let docker_runner = DockerRunner::new(Arc::new(docker), worker_id.clone());
     let shutdown = CancellationToken::new();
-    let kafka_config = KafkaConfig{
-        broker:  kafka_addr,
+    let kafka_config = KafkaConfig {
+        broker: kafka_addr,
         group_id: String::from("judge-worker"),
     };
     let ctx = WorkerContext {
@@ -97,7 +88,7 @@ async fn run_worker(
     //     ctx,
     //     shutdown.clone(),
     // )?;
-    let mut pool = WorkerPool::new(kafka_config,ctx,shutdown.clone());
+    let pool = WorkerPool::new(kafka_config, ctx, shutdown.clone());
     pool.start(3).await;
     metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
@@ -108,7 +99,7 @@ async fn run_worker(
     //     "worker started"
     // );
     let pool = Arc::new(pool);
-    let worker_state = WorkerState::new(metrics.clone(),Arc::clone(&pool));
+    let worker_state = WorkerState::new(metrics.clone(), Arc::clone(&pool));
     let router = Router::new()
         .merge(routes::worker_router())
         .with_state(Arc::new(worker_state));
@@ -154,32 +145,19 @@ async fn run_worker(
     Ok(())
 }
 async fn run_api(
-    // jobs: Arc<JobStore>,
-    // kafka: KafkaProducer,
-    // docker_runner: DockerRunner,
-    router: Router,
+    jobs: Arc<JobStore>,
+    kafka: KafkaProducer,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
-    // for worker_id in 0..3 {
-    //     let consumer = KafkaConsumer::new(
-    //         "localhost:9092",
-    //         "judge-worker",
-    //         docker_runner.clone(),
-    //         jobs.clone(),
-    //         kafka.producer.clone(),
-    //         worker_id,
-    //     )?;
-    //     consumer.subscribe()?;
-    //     tokio::spawn(async move {
-    //         tracing::info!(worker_id, "worker started");
-    //         if let Err(error) = consumer.run().await {
-    //             tracing::error!(
-    //                 worker_id,
-    //                 error = ?error,
-    //                 "worker stopped"
-    //             );
-    //         }
-    //     });
-    // }
+    let cors = CorsLayer::new()
+        .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
+        .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers(Any);
+    let router = Router::new()
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(cors)
+        .merge(routes::router())
+        .with_state(AppState::new(jobs, kafka, metrics));
     let listener = TcpListener::bind("0.0.0.0:4000").await?;
     tracing::info!("Listening on http://0.0.0.0:4000");
 
