@@ -2,8 +2,11 @@ use crate::apierror::ApiError;
 use crate::docker::exec::ExecResult;
 use crate::job::Job;
 use crate::metrics::Metrics;
-use crate::models::{JobIdResponse, JobMessage, JobResponse, RunRequest, RunResponse, RunStatus};
-use crate::state::{AppState, JobState};
+use crate::models::{
+    JobIdResponse, JobMessage, JobResponse, RunRequest, RunResponse, RunStatus, ScaleRequest,
+};
+use crate::state::{AppState, JobState, WorkerState};
+use crate::worker::pool::WorkerInfo;
 use axum::error_handling::HandleError;
 use axum::extract::Path;
 use axum::extract::rejection::JsonRejection;
@@ -27,10 +30,13 @@ pub fn router() -> Router<AppState> {
         .route("/run/{job_id}", get(get_job))
 }
 
-pub fn worker_router() -> Router<Arc<Metrics>> {
+pub fn worker_router() -> Router<Arc<WorkerState>> {
     Router::new()
         .route("/metrics", get(metrics))
         .route("/health", get(health))
+        .route("/workers", get(list_workers))
+        .route("/workers/scale-up", post(scale_up))
+        .route("/workers/scale-down", post(scale_down))
 }
 
 async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -107,9 +113,9 @@ async fn get_job(
     Ok(Json(job.into()))
 }
 
-async fn metrics(State(metrics): State<Arc<Metrics>>) -> impl axum::response::IntoResponse {
+async fn metrics(State(state): State<Arc<WorkerState>>) -> impl axum::response::IntoResponse {
     let encoder = prometheus::TextEncoder::new();
-    let metric_families = metrics.registry.gather();
+    let metric_families = state.metrics.registry.gather();
 
     let mut buffer = vec![];
     encoder.encode(&metric_families, &mut buffer).unwrap();
@@ -119,4 +125,24 @@ async fn metrics(State(metrics): State<Arc<Metrics>>) -> impl axum::response::In
 
 async fn health() -> impl axum::response::IntoResponse {
     StatusCode::OK
+}
+
+pub async fn list_workers(State(state): State<Arc<WorkerState>>) -> Json<Vec<WorkerInfo>> {
+    Json(state.worker_pool.list_workers().await)
+}
+
+pub async fn scale_up(
+    State(state): State<Arc<WorkerState>>,
+    Json(req): Json<ScaleRequest>,
+) -> StatusCode {
+    state.worker_pool.scale_up(req.count).await;
+    StatusCode::NO_CONTENT
+}
+
+pub async fn scale_down(
+    State(state): State<Arc<WorkerState>>,
+    Json(req): Json<ScaleRequest>,
+) -> StatusCode {
+    state.worker_pool.scale_down(req.count).await;
+    StatusCode::NO_CONTENT
 }
