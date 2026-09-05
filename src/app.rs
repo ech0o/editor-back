@@ -7,7 +7,7 @@ use crate::kafka::{KafkaConfig, KafkaConsumer, KafkaProducer};
 use crate::metrics::Metrics;
 use crate::models::{RunRequest, RunResponse, RunStatus};
 use crate::reaper::Reaper;
-use crate::state::JobState;
+use crate::state::{JobState, WorkerState};
 use crate::workspace::Workspace;
 use crate::{routes, state::AppState};
 use axum::Router;
@@ -48,6 +48,7 @@ pub async fn create_app() -> anyhow::Result<()> {
     let kafka = KafkaProducer::new(kafka_addr.as_str())?;
     let jobs = Arc::new(JobStore::new(db));
     let metrics = Arc::new(Metrics::new()?);
+
     let cors = CorsLayer::new()
         .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
         .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
@@ -106,9 +107,11 @@ async fn run_worker(
     //     pid = std::process::id(),
     //     "worker started"
     // );
+    let pool = Arc::new(pool);
+    let worker_state = WorkerState::new(metrics.clone(),Arc::clone(&pool));
     let router = Router::new()
         .merge(routes::worker_router())
-        .with_state(metrics);
+        .with_state(Arc::new(worker_state));
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

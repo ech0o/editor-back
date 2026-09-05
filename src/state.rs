@@ -11,6 +11,7 @@ use tokio::sync::{RwLock, Semaphore, mpsc};
 use uuid::Uuid;
 use crate::db::Database;
 use crate::metrics::Metrics;
+use crate::worker::pool::WorkerPool;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,7 +27,7 @@ impl AppState {
     pub fn new(
         job_store: Arc<JobStore>,
         kafka_producer: KafkaProducer,
-        metrics: Arc<Metrics>
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(4)),
@@ -41,4 +42,20 @@ impl AppState {
 pub struct JobState {
     pub status: RunStatus,
     pub result: Option<RunResponse>,
+}
+
+
+#[derive(Clone)]
+pub struct WorkerState {
+    pub worker_pool: Arc<WorkerPool>,
+    pub metrics:Arc<Metrics>,
+}
+
+impl WorkerState {
+    pub fn new(metrics: Arc<Metrics>,worker_pool:Arc<WorkerPool>)->Self{
+        Self{
+            metrics,
+            worker_pool,
+        }
+    }
 }
