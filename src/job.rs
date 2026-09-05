@@ -323,7 +323,7 @@ SET status = $1 WHERE id = $2"#,
     }
 
 
-    pub async fn is_job_execution_alive(&self,job_id:Uuid) -> anyhow::Result<bool> {
+    pub async fn is_job_execution_alive(&self, job_id:Uuid) -> anyhow::Result<bool> {
         let row = sqlx::query!(
             r#"
 SELECT EXISTS(
