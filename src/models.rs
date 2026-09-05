@@ -151,3 +151,8 @@ pub struct DlqMessage{
     pub partition:i32,
     pub offset:i64,
 }
+
+#[derive(Debug,Serialize,Deserialize)]
+pub struct ScaleRequest{
+    pub count: usize,
+}
