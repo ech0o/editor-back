@@ -4,9 +4,11 @@ use crate::kafka::KafkaConfig;
 use crate::metrics::Metrics;
 use crate::worker::{Worker, WorkerContext};
 use rdkafka::producer::FutureProducer;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::format;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -18,14 +20,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub(crate) struct WorkerPool {
     workers: Arc<Mutex<HashMap<String, WorkerStatus>>>,
-    next_worker_id: usize,
-    supervisors: Vec<JoinHandle<()>>,
+    next_worker_id: AtomicUsize,
+    supervisors: Mutex<HashMap<String, JoinHandle<()>>>,
+    controls: Arc<Mutex<HashMap<String, WorkerControl>>>,
     kafka_config: KafkaConfig,
     ctx: WorkerContext,
     shutdown: CancellationToken,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WorkerStatus {
     Starting,
     Running,
@@ -33,7 +37,7 @@ pub enum WorkerStatus {
     Stopped,
 }
 
-impl WorkerStatus{
+impl WorkerStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             WorkerStatus::Starting => "starting",
@@ -44,20 +48,27 @@ impl WorkerStatus{
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
     pub worker_id: String,
+    pub status: WorkerStatus,
+}
+
+#[derive(Clone)]
+pub struct WorkerControl {
+    pub shutdown: CancellationToken,
 }
 
 impl WorkerPool {
     pub fn new(kafka_config: KafkaConfig, ctx: WorkerContext, shutdown: CancellationToken) -> Self {
         Self {
             workers: Arc::new(Mutex::new(HashMap::new())),
-            next_worker_id: 1,
+            next_worker_id: AtomicUsize::new(1),
             kafka_config,
             ctx,
             shutdown,
-            supervisors: Vec::new(),
+            controls: Arc::new(Mutex::new(HashMap::new())),
+            supervisors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,13 +76,13 @@ impl WorkerPool {
         workers: &Arc<Mutex<HashMap<String, WorkerStatus>>>,
         worker_id: &str,
         status: WorkerStatus,
-        metrics:&Metrics,
+        metrics: &Metrics,
     ) {
         {
             let mut workers = workers.lock().await;
             workers.insert(worker_id.to_string(), status);
         }
-        metrics.set_worker_status(worker_id,status);
+        metrics.set_worker_status(worker_id, status);
     }
 
     // pub fn spawn_worker(&mut self) -> anyhow::Result<()> {
@@ -90,20 +101,22 @@ impl WorkerPool {
     //     Ok(())
     // }
 
-    pub async fn start_worker(&mut self) {
-        let worker_id = format!("worker-{}", self.next_worker_id);
-        self.next_worker_id += 1;
+    pub async fn start_worker(&self) {
+        let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+        let worker_id = format!("worker-{id}");
         let workers = Arc::clone(&self.workers);
         let kafka = self.kafka_config.clone();
         let ctx = self.ctx.clone();
         let shutdown = self.shutdown.clone();
+        let id_clone = worker_id.clone();
+        let controls = self.controls.clone();
         let handle = tokio::spawn(async move {
-            Self::supervise_worker(worker_id, kafka, ctx, workers, shutdown).await;
+            Self::supervise_worker(id_clone, kafka, ctx, workers, shutdown, controls).await;
         });
-        self.supervisors.push(handle);
+        self.supervisors.lock().await.insert(worker_id, handle);
     }
 
-    pub async fn start(&mut self, size: usize) {
+    pub async fn start(&self, size: usize) {
         for _ in 0..size {
             self.start_worker().await;
         }
@@ -115,11 +128,12 @@ impl WorkerPool {
         ctx: WorkerContext,
         workers: Arc<Mutex<HashMap<String, WorkerStatus>>>,
         shutdown: CancellationToken,
+        controls: Arc<Mutex<HashMap<String, WorkerControl>>>,
     ) {
         let mut backoff = INITIAL_BACKOFF;
         let metrics = Arc::clone(&ctx.metrics);
         loop {
-            Self::set_status(&workers, &worker_id, WorkerStatus::Starting,&metrics).await;
+            Self::set_status(&workers, &worker_id, WorkerStatus::Starting, &metrics).await;
             let worker = match Worker::new(worker_id.clone(), kafka.clone(), ctx.clone()) {
                 Ok(worker) => {
                     backoff = INITIAL_BACKOFF;
@@ -132,24 +146,38 @@ impl WorkerPool {
                         ?backoff,
                         "failed to create worker"
                     );
-                    Self::set_status(&workers, &worker_id, WorkerStatus::Restarting,&metrics).await;
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff)=>{}
-                        _ = shutdown.cancelled() => {
-                            Self::set_status(&workers, &worker_id, WorkerStatus::Stopped,&metrics).await;
-                            return;
-                        }
+                    Self::set_status(&workers, &worker_id, WorkerStatus::Restarting, &metrics)
+                        .await;
+                    if !Self::wait_or_shutdown(backoff, &shutdown).await {
+                        Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics)
+                            .await;
+                        return;
                     }
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                     continue;
                 }
             };
+            let worker_shutdown = worker.shutdown.clone();
+
+            {
+                let mut controls = controls.lock().await;
+                controls.insert(
+                    worker_id.clone(),
+                    WorkerControl {
+                        shutdown: worker_shutdown.clone(),
+                    },
+                );
+            }
             let start_at = tokio::time::Instant::now();
-            Self::set_status(&workers, &worker_id, WorkerStatus::Running,&metrics).await;
+            Self::set_status(&workers, &worker_id, WorkerStatus::Running, &metrics).await;
             let worker_shutdown = worker.shutdown.clone();
             let mut handle = tokio::spawn(async move { worker.run().await });
-            if start_at.elapsed() > Duration::from_secs(30){
+            if start_at.elapsed() > Duration::from_secs(30) {
                 backoff = INITIAL_BACKOFF;
+            }
+            {
+                let mut controls = controls.lock().await;
+                controls.remove(&worker_id);
             }
             tokio::select! {
                 result = &mut handle => {
@@ -178,14 +206,15 @@ impl WorkerPool {
                              metrics.worker_restarted(&worker_id);
                         }
                     }
+                    if worker_shutdown.is_cancelled(){
+                        Self::set_status(&workers,&worker_id,WorkerStatus::Stopped,&metrics).await;
+                        return;
+                    }
                     Self::set_status(&workers, &worker_id, WorkerStatus::Restarting,&metrics).await;
                     // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = shutdown.cancelled() => {
-                            Self::set_status(&workers, &worker_id, WorkerStatus::Stopped,&metrics).await;
-                            return;
-                        }
+                   if !Self::wait_or_shutdown(backoff,&shutdown).await{
+                        Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics).await;
+                        return;
                     }
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                 }
@@ -194,38 +223,22 @@ impl WorkerPool {
                     worker_shutdown.cancel();
                     let _ = handle.await;
                     Self::set_status(&workers, &worker_id, WorkerStatus::Stopped,&metrics).await;
+
                     break;
                 }
             }
         }
     }
 
-    // pub fn remove_finished_worker(&mut self) {
-    //     let finished: Vec<String> = self
-    //         .workers
-    //         .iter()
-    //         .filter_map(|(worker_id, handle)| {
-    //             if handle.is_finished() {
-    //                 Some(worker_id.clone())
-    //             } else {
-    //                 None
-    //             }
-    //         })
-    //         .collect();
-    //
-    //     for worker_id in finished {
-    //         if let Some(handle) = self.workers.remove(&worker_id) {
-    //             tokio::spawn(async move {
-    //                 if let Err(err) = handle.await {
-    //                     tracing::error!(err=%err, "worker failed error");
-    //                 }
-    //             });
-    //         }
-    //     }
-    // }
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&self) {
         self.shutdown.cancel();
-        for handle in self.supervisors {
+        let handles = {
+            let mut supervisors = self.supervisors.lock().await;
+            supervisors.drain()
+                .map(|(_, handle)| handle)
+            .collect::<Vec<_>>()
+        };
+        for handle in handles {
             if let Err(e) = handle.await {
                 tracing::error!(
                     error=%e,
@@ -234,5 +247,76 @@ impl WorkerPool {
             }
         }
         tracing::info!("worker pool stopped");
+    }
+
+    pub async fn list_workers(&self) -> Vec<WorkerInfo> {
+        let workers = self.workers.lock().await;
+        workers
+            .iter()
+            .map(|(worker_id, status)| WorkerInfo {
+                worker_id: worker_id.clone(),
+                status: *status,
+            })
+            .collect()
+    }
+
+    async fn wait_or_shutdown(duration: Duration, shutdown: &CancellationToken) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => true,
+            _ = shutdown.cancelled() => false,
+        }
+    }
+
+    pub async fn stop_worker(&self, worker_id: &str) {
+        let control = {
+            let controls = self.controls.lock().await;
+            controls.get(worker_id).cloned()
+        };
+        if let Some(control) = control {
+            control.shutdown.cancel();
+        } else {
+            tracing::warn!(worker_id=%worker_id,"worker control not found");
+            return;
+        };
+        let handle = {
+            let mut supervisors = self.supervisors.lock().await;
+            supervisors.remove(worker_id)
+        };
+        if let Some(handle) = handle {
+            if let Err(e) = handle.await {
+                tracing::error!(
+                    worker_id=%worker_id,
+                    error=%e,
+                    "worker supervisor failed while stopping"
+                )
+            }
+        }
+        // control.shutdown.cancel();
+    }
+
+    pub async fn scale_down(&self, count: usize) {
+        let worker_ids = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .filter_map(|(worker_id, status)| {
+                    matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
+                })
+                .take(count)
+                .collect::<Vec<_>>()
+        };
+        for worker_id in worker_ids {
+            self.stop_worker(&worker_id).await;
+        }
+    }
+
+    pub async fn scale_up(&self, count: usize) {
+        for _ in 0..count {
+            self.start_worker().await;
+        }
+    }
+    pub async fn managed_worker_count(&self) -> usize {
+        let workers = self.workers.lock().await;
+        workers.len()
     }
 }
