@@ -175,12 +175,13 @@ impl WorkerPool {
             if start_at.elapsed() > Duration::from_secs(30) {
                 backoff = INITIAL_BACKOFF;
             }
-            {
-                let mut controls = controls.lock().await;
-                controls.remove(&worker_id);
-            }
+
             tokio::select! {
                 result = &mut handle => {
+                    {
+                        let mut controls = controls.lock().await;
+                        controls.remove(&worker_id);
+                    }
                     match result {
                         Ok(Ok(_)) => {
                             tracing::warn!(
@@ -234,9 +235,10 @@ impl WorkerPool {
         self.shutdown.cancel();
         let handles = {
             let mut supervisors = self.supervisors.lock().await;
-            supervisors.drain()
+            supervisors
+                .drain()
                 .map(|(_, handle)| handle)
-            .collect::<Vec<_>>()
+                .collect::<Vec<_>>()
         };
         for handle in handles {
             if let Err(e) = handle.await {
@@ -297,12 +299,17 @@ impl WorkerPool {
     pub async fn scale_down(&self, count: usize) {
         let worker_ids = {
             let workers = self.workers.lock().await;
+            let running_count = workers
+                .values()
+                .filter(|status| matches!(status, WorkerStatus::Running))
+                .count();
+            let removable = running_count.saturating_sub(1);
             workers
                 .iter()
                 .filter_map(|(worker_id, status)| {
                     matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
                 })
-                .take(count)
+                .take(count.min(removable))
                 .collect::<Vec<_>>()
         };
         for worker_id in worker_ids {
