@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use crate::worker::workspace::WorkerWorkspace;
 
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,7 +35,6 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Clone)]
 pub struct DockerRunner {
     docker: Arc<Docker>,
-    worker_id: String,
 }
 
 // #[derive(Serialize, Debug)]
@@ -44,8 +44,8 @@ pub struct DockerRunner {
 //     exit_code: i64,
 // }
 impl DockerRunner {
-    pub fn new(docker: Arc<Docker>, worker_id: String) -> Self {
-        Self { docker, worker_id }
+    pub fn new(docker: Arc<Docker>) -> Self {
+        Self { docker }
     }
 
     pub fn docker(&self) -> &Docker {
@@ -56,10 +56,10 @@ impl DockerRunner {
         pull_if_needed(self.docker(), image).await
     }
 
-    pub async fn create(&self, image: &str, workspace: &Path, job_id: Uuid,temp_path:String) -> Result<String> {
+    pub async fn create(&self,worker_id:&str, image: &str, workspace: &Path, job_id: Uuid,temp_path:String) -> Result<String> {
         self.pull_if_needed(image).await?;
         let main_rs = workspace.join("main.rs");
-
+        tracing::info!(path=%workspace.display(), "creating path:");
         tracing::debug!(
             path = %main_rs.display(),
             exists = main_rs.exists(),
@@ -86,7 +86,7 @@ impl DockerRunner {
         let label = HashMap::from([
             ("app".to_string(), "code-runner".to_string()),
             ("managed-by".to_string(), "worker".to_string()),
-            ("oj.worker_id".to_string(), self.worker_id.clone()),
+            ("oj.worker_id".to_string(), worker_id.to_string()),
             ("oj.job_id".to_string(), job_id.to_string()),
             (
                 "oj.workspace".to_string(),
@@ -139,17 +139,20 @@ impl DockerRunner {
 
     pub async fn run_rust(
         &self,
+        worker_id: &str,
         job_id: Uuid,
         code: &str,
         cancel: CancellationToken,
+        workspace: Workspace
     ) -> anyhow::Result<RunResponse, RunError> {
-        let workspace = Workspace::new(self.worker_id.as_str()).map_err(RunError::Other)?;
+        // let workspace = Workspace::new(worker_id).map_err(RunError::Other)?;
         workspace.write("main.rs", code).map_err(RunError::Other)?;
         self.with_container(
             "rust:1.89",
             workspace.host_path(),
             cancel,
             job_id,
+            worker_id,
             workspace.path().to_string_lossy().into_owned(),
             |id| async move {
                 // let res =self.exec(&id,vec!["ls".into(),"/workspaces".into()]).await?;
@@ -267,6 +270,7 @@ impl DockerRunner {
         workspace: &Path,
         cancel: CancellationToken,
         job_id: Uuid,
+        worker_id: &str,
         temp_path:String,
         f: F,
     ) -> Result<RunResponse, RunError>
@@ -275,7 +279,7 @@ impl DockerRunner {
         Fut: Future<Output = anyhow::Result<RunResponse, RunError>>,
     {
         let id = self
-            .create(image, workspace, job_id, temp_path)
+            .create(worker_id, image, workspace, job_id, temp_path)
             .await
             .map_err(RunError::Other)?;
         self.start(id.as_str()).await.map_err(RunError::Other)?;

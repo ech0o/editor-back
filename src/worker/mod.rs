@@ -3,18 +3,18 @@ use crate::job::JobStore;
 use crate::kafka::{KafkaConfig, KafkaConsumer, KafkaProducer};
 use crate::metrics::Metrics;
 use crate::worker::workspace::WorkerWorkspace;
+use anyhow::Error;
 use rdkafka::producer::FutureProducer;
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::Error;
 use tokio_util::sync::CancellationToken;
 
 pub mod pool;
-mod workspace;
+pub mod workspace;
 
 pub struct Worker {
     pub worker_id: String,
-    pub workspace: WorkerWorkspace,
+    pub workspace: Arc<WorkerWorkspace>,
     pub consumer: KafkaConsumer,
     pub shutdown: CancellationToken,
 }
@@ -32,11 +32,17 @@ impl Worker {
         kafka_config: KafkaConfig,
         ctx: WorkerContext,
     ) -> anyhow::Result<Self> {
-        let workspace = WorkerWorkspace::new(worker_id.as_str())?;
+        let workspace = Arc::new(WorkerWorkspace::new(worker_id.as_str())?);
 
         let shutdown = CancellationToken::new();
 
-        let consumer = KafkaConsumer::new(&worker_id, &kafka_config, ctx, shutdown.clone())?;
+        let consumer = KafkaConsumer::new(
+            &worker_id,
+            &kafka_config,
+            ctx,
+            shutdown.clone(),
+            Arc::clone(&workspace),
+        )?;
         Ok(Self {
             worker_id,
             workspace,
@@ -56,8 +62,8 @@ impl Worker {
 
         Ok(())
     }
-    
-    pub fn shutdown(&self)->&CancellationToken {
+
+    pub fn shutdown(&self) -> &CancellationToken {
         &self.shutdown
     }
 }

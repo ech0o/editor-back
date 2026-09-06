@@ -69,7 +69,7 @@ async fn run_worker(
         .into_owned();
     tracing::info!("initializing worker,{}", kafka_addr.as_str());
     let docker = Docker::connect_with_local_defaults()?;
-    let docker_runner = DockerRunner::new(Arc::new(docker), worker_id.clone());
+    let docker_runner = DockerRunner::new(Arc::new(docker));
     let shutdown = CancellationToken::new();
     let kafka_config = KafkaConfig {
         broker: kafka_addr,
@@ -88,7 +88,7 @@ async fn run_worker(
     //     ctx,
     //     shutdown.clone(),
     // )?;
-    let pool = WorkerPool::new(kafka_config, ctx, shutdown.clone());
+    let pool = Arc::new(WorkerPool::new(kafka_config, ctx, shutdown.clone()));
     pool.start(3).await;
     metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
@@ -98,7 +98,7 @@ async fn run_worker(
     //     pid = std::process::id(),
     //     "worker started"
     // );
-    let pool = Arc::new(pool);
+    // let pool = Arc::new(pool);
     let worker_state = WorkerState::new(metrics.clone(), Arc::clone(&pool));
     let router = Router::new()
         .merge(routes::worker_router())

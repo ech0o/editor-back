@@ -4,6 +4,7 @@ use crate::job::{Job, JobStore};
 use crate::metrics::{Metrics, RunningGuard, job_completed, job_duration, job_failed};
 use crate::models::{DlqMessage, JobMessage, RunStatus};
 use crate::worker::WorkerContext;
+use crate::worker::workspace::WorkerWorkspace;
 use crate::workspace::Workspace;
 use anyhow::{anyhow, bail};
 use chrono::Utc;
@@ -32,6 +33,7 @@ pub struct KafkaConsumer {
     jobs: Arc<JobStore>,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
+    workspace: Arc<WorkerWorkspace>,
 }
 
 #[derive(Clone)]
@@ -82,8 +84,10 @@ impl KafkaConsumer {
         kafka: &KafkaConfig,
         ctx: WorkerContext,
         shutdown: CancellationToken,
+        workspace:Arc<WorkerWorkspace>,
     ) -> anyhow::Result<Self> {
         let consumer = kafka.create_consumer()?;
+        // let workspace = Arc::new(WorkerWorkspace::new(&worker_id)?);
         Ok(Self {
             consumer,
             runner: ctx.runner,
@@ -91,6 +95,7 @@ impl KafkaConsumer {
             producer: ctx.producer,
             worker_id: String::from(worker_id),
             metrics: ctx.metrics,
+            workspace,
             shutdown,
         })
     }
@@ -137,6 +142,10 @@ impl KafkaConsumer {
         };
         // let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let cancel_execution = tokio_util::sync::CancellationToken::new();
+        let workspace = self
+            .workspace
+            .create_job_workspace(job_msg.job_id)
+            .map_err(ProcessError::Retryable)?;
         let jobs = self.jobs.clone();
         let job_id = job.id;
         let heartbeat_cancel = CancellationToken::new();
@@ -189,7 +198,13 @@ impl KafkaConsumer {
                     .start_timer();
                 let _running = RunningGuard::new(self.metrics.jobs_running.clone());
                 self.runner
-                    .run_rust(job.id, &job.code, cancel_execution)
+                    .run_rust(
+                        self.worker_id.as_str(),
+                        job.id,
+                        &job.code,
+                        cancel_execution,
+                        workspace,
+                    )
                     .await
             }
             _ => {
