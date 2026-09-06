@@ -78,16 +78,16 @@ services:
 #      WORKER_ID: "1"
       KAFKA_BROKERS: "kafka:9092"
       DATABASE_URL: "postgres://postgres:example@db:5432/postgres"
-      WORKSPACE_HOST_ROOT: "${PWD}/workspaces"
+      WORKSPACE_HOST_ROOT: "${PWD}"
     depends_on:
       kafka:
         condition: service_healthy
       db:
         condition: service_healthy
-    expose:
-      - "9091"
+    ports:
+      - "9091:9091"
 #    deploy:
-#      replicas: 3
+#      replicas: 2
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD","curl","-f","http://127.0.0.1:9091/health"]
@@ -105,7 +105,7 @@ services:
     #    tty: true
 #    command: [ ]
     ports:
-      - 4000:4000
+      - "4000:4000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
