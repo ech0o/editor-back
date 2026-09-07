@@ -90,6 +90,7 @@ async fn run_worker(
     // )?;
     let pool = Arc::new(WorkerPool::new(kafka_config, ctx, shutdown.clone()));
     pool.start(3).await;
+    pool.clone().start_reconciler().await;
     metrics.worker_started_total.inc();
     let listener = TcpListener::bind("0.0.0.0:9091").await?;
     tracing::info!("Listening on http://0.0.0.0:9091");
