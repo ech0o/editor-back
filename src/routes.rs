@@ -37,6 +37,7 @@ pub fn worker_router() -> Router<Arc<WorkerState>> {
         .route("/workers", get(list_workers))
         .route("/workers/scale-up", post(scale_up))
         .route("/workers/scale-down", post(scale_down))
+        .route("/workers/{worker_id}/restart", post(restart_worker))
 }
 
 async fn handle_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -145,4 +146,16 @@ pub async fn scale_down(
 ) -> StatusCode {
     state.worker_pool.scale_down(req.count).await;
     StatusCode::NO_CONTENT
+}
+
+pub async fn restart_worker(
+    State(state): State<Arc<WorkerState>>,
+    Path(worker_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .worker_pool
+        .restart_worker(&worker_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
