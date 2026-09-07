@@ -18,13 +18,15 @@ use tokio_util::sync::CancellationToken;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-pub(crate) struct WorkerPool {
+pub struct WorkerPool {
     workers: Arc<Mutex<HashMap<String, WorkerStatus>>>,
     next_worker_id: AtomicUsize,
-    supervisors: Mutex<HashMap<String, JoinHandle<()>>>,
+    desired_size: AtomicUsize,
+    supervisors: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     controls: Arc<Mutex<HashMap<String, WorkerControl>>>,
     kafka_config: KafkaConfig,
     ctx: WorkerContext,
+    reconciler: Mutex<Option<JoinHandle<()>>>,
     shutdown: CancellationToken,
 }
 
@@ -64,11 +66,13 @@ impl WorkerPool {
         Self {
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_worker_id: AtomicUsize::new(1),
+            desired_size: AtomicUsize::new(0),
             kafka_config,
             ctx,
             shutdown,
+            reconciler: Mutex::new(None),
             controls: Arc::new(Mutex::new(HashMap::new())),
-            supervisors: Mutex::new(HashMap::new()),
+            supervisors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -103,23 +107,32 @@ impl WorkerPool {
 
     pub async fn start_worker(&self) {
         let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+
         let worker_id = format!("worker-{id}");
+
+        self.spawn_supervisor(worker_id).await;
+    }
+
+    pub async fn spawn_supervisor(&self, worker_id: String) {
         let workers = Arc::clone(&self.workers);
         let kafka = self.kafka_config.clone();
         let ctx = self.ctx.clone();
         let shutdown = self.shutdown.clone();
-        let id_clone = worker_id.clone();
-        let controls = self.controls.clone();
+        let controls = Arc::clone(&self.controls);
+        let worker_id_clone = worker_id.clone();
+        let supervisor_worker_id = worker_id.clone();
+        let supervisors = Arc::clone(&self.supervisors);
         let handle = tokio::spawn(async move {
-            Self::supervise_worker(id_clone, kafka, ctx, workers, shutdown, controls).await;
+            Self::supervise_worker(worker_id_clone, kafka, ctx, workers, shutdown, controls).await;
+            let mut supervisor = supervisors.lock().await;
+            supervisor.remove(&supervisor_worker_id);
         });
         self.supervisors.lock().await.insert(worker_id, handle);
     }
 
     pub async fn start(&self, size: usize) {
-        for _ in 0..size {
-            self.start_worker().await;
-        }
+        self.desired_size.store(size, Ordering::Relaxed);
+        self.reconcile().await;
     }
 
     async fn supervise_worker(
@@ -178,10 +191,7 @@ impl WorkerPool {
 
             tokio::select! {
                 result = &mut handle => {
-                    {
-                        let mut controls = controls.lock().await;
-                        controls.remove(&worker_id);
-                    }
+
                     match result {
                         Ok(Ok(_)) => {
                             tracing::warn!(
@@ -208,18 +218,31 @@ impl WorkerPool {
                         }
                     }
                     if worker_shutdown.is_cancelled(){
+
+                        {
+                            let mut controls = controls.lock().await;
+                            controls.remove(&worker_id);
+                        }
                         Self::set_status(&workers,&worker_id,WorkerStatus::Stopped,&metrics).await;
                         return;
                     }
                     Self::set_status(&workers, &worker_id, WorkerStatus::Restarting,&metrics).await;
                     // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                    if !Self::wait_or_shutdown(backoff,&shutdown).await{
+                        {
+                            let mut controls = controls.lock().await;
+                            controls.remove(&worker_id);
+                        }
                         Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics).await;
                         return;
                     }
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                 }
                 _ = shutdown.cancelled() => {
+                     // {
+                     //        let mut controls = controls.lock().await;
+                     //        controls.remove(&worker_id);
+                     // }
                     tracing::info!(worker_id=%worker_id,"supervisor shutting down worker");
                     worker_shutdown.cancel();
                     let _ = handle.await;
@@ -233,6 +256,14 @@ impl WorkerPool {
 
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
+        if let Some(handle) = self.reconciler.lock().await.take() {
+            if let Err(e) = handle.await {
+                tracing::error!(
+                    error=%e,
+                    "reconciler failed during shutdown"
+                )
+            }
+        }
         let handles = {
             let mut supervisors = self.supervisors.lock().await;
             supervisors
@@ -297,33 +328,152 @@ impl WorkerPool {
     }
 
     pub async fn scale_down(&self, count: usize) {
-        let worker_ids = {
-            let workers = self.workers.lock().await;
-            let running_count = workers
-                .values()
-                .filter(|status| matches!(status, WorkerStatus::Running))
-                .count();
-            let removable = running_count.saturating_sub(1);
-            workers
-                .iter()
-                .filter_map(|(worker_id, status)| {
-                    matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
-                })
-                .take(count.min(removable))
-                .collect::<Vec<_>>()
-        };
-        for worker_id in worker_ids {
-            self.stop_worker(&worker_id).await;
-        }
+        self.desired_size.fetch_sub(count, Ordering::Relaxed);
+        // self.reconcile().await;
+        // let new_size = current.saturating_sub(count);
+        // let remove_count = current.saturating_sub(new_size);
+        // self.desired_size.store(new_size, Ordering::Relaxed);
+        //
+        // let worker_ids = {
+        //     let workers = self.workers.lock().await;
+        //     let running_count = workers
+        //         .values()
+        //         .filter(|status| matches!(status, WorkerStatus::Running))
+        //         .count();
+        //     // let removable = running_count.saturating_sub(1);
+        //     workers
+        //         .iter()
+        //         .filter_map(|(worker_id, status)| {
+        //             matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
+        //         })
+        //         .take(remove_count)
+        //         .collect::<Vec<_>>()
+        // };
+        // for worker_id in worker_ids {
+        //     self.stop_worker(&worker_id).await;
+        // }
     }
 
     pub async fn scale_up(&self, count: usize) {
-        for _ in 0..count {
-            self.start_worker().await;
-        }
+        self.desired_size.fetch_add(count, Ordering::Relaxed);
+        // self.reconcile().await;
     }
     pub async fn managed_worker_count(&self) -> usize {
         let workers = self.workers.lock().await;
         workers.len()
+    }
+
+    pub async fn restart_worker(&self, worker_id: &str) -> anyhow::Result<()> {
+        let exists = {
+            let workers = self.workers.lock().await;
+            workers.contains_key(worker_id)
+        };
+        if !exists {
+            anyhow::bail!("worker {} not found", worker_id);
+        }
+        tracing::info!(
+            worker_id = %worker_id,
+            "restarting worker"
+        );
+        Self::set_status(
+            &self.workers,
+            worker_id,
+            WorkerStatus::Restarting,
+            &self.ctx.metrics,
+        )
+        .await;
+        self.stop_worker(worker_id).await;
+
+        if self.shutdown.is_cancelled() {
+            return Ok(());
+        }
+        self.spawn_supervisor(worker_id.to_string()).await;
+        Ok(())
+    }
+
+    pub async fn reconcile(&self) {
+        let desired = self.desired_size.load(Ordering::Relaxed);
+
+        let actual = {
+            let supervisors = self.supervisors.lock().await;
+            supervisors.len()
+        };
+        if actual < desired {
+            let count = desired - actual;
+            for _ in 0..count {
+                self.start_worker().await;
+            }
+        } else if actual > desired {
+            let count = actual - desired;
+            let worker_ids = {
+                let workers = self.workers.lock().await;
+                workers
+                    .iter()
+                    .filter_map(|(worker_id, status)| {
+                        matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
+                    })
+                    .take(count)
+                    .collect::<Vec<_>>()
+            };
+            for worker_id in worker_ids {
+                self.stop_worker(&worker_id).await;
+            }
+        }
+        // let worker_ids_to_stop = {
+        //     let workers = self.workers.lock().await;
+        //     let actual = workers
+        //         .values()
+        //         .filter(|status| !matches!(status, WorkerStatus::Stopped))
+        //         .count();
+        //     if actual <= desired {
+        //         Vec::new()
+        //     } else {
+        //         let count = actual - desired;
+        //         workers
+        //             .iter()
+        //             .filter_map(|(worker_id, status)| {
+        //                 matches!(status, WorkerStatus::Running).then(|| worker_id.clone())
+        //             })
+        //             .take(count)
+        //             .collect::<Vec<_>>()
+        //     }
+        // };
+        //
+        // for worker_id in worker_ids_to_stop {
+        //     self.stop_worker(&worker_id).await;
+        // }
+        //
+        // let actual = {
+        //     let workers = self.workers.lock().await;
+        //     workers
+        //         .values()
+        //         .filter(|status| !matches!(status, WorkerStatus::Stopped))
+        //         .count()
+        // };
+        //
+        // if actual < desired {
+        //     let count = desired - actual;
+        //     for _ in 0..count {
+        //         self.start_worker().await;
+        //     }
+        // }
+    }
+
+    pub async fn start_reconciler(self: Arc<Self>) {
+        let pool = Arc::clone(&self);
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = pool.shutdown.cancelled() => {
+                        tracing::info!("reconciler stopped");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        pool.reconcile().await;
+                    }
+                }
+            }
+        });
+        *self.reconciler.lock().await = Some(handle);
     }
 }
