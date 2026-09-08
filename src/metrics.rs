@@ -2,7 +2,7 @@ use crate::worker::pool::WorkerStatus;
 use prometheus::core::Collector;
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    Opts, Registry,
+    IntGauge, Opts, Registry,
 };
 
 pub fn gather() -> String {
@@ -29,6 +29,10 @@ pub struct Metrics {
     pub job_duration_seconds: HistogramVec,
     pub job_queue_latency_seconds: Histogram,
     pub jobs_finished_by_status: IntCounterVec,
+
+    pub worker_pool_desired: IntGauge,
+    pub worker_pool_current: IntGauge,
+    pub worker_pool_restarts_total: IntCounter,
     pub registry: Registry,
 }
 
@@ -79,6 +83,15 @@ impl Metrics {
             &["worker_id"],
         )?;
 
+        let worker_pool_desired =
+            IntGauge::new("worker_pool_desired", "Total number of worker pool desired")?;
+
+        let worker_pool_current =
+            IntGauge::new("worker_pool_current", "Current number of worker pool")?;
+
+        let worker_pool_restarts_total =
+            IntCounter::new("worker_pool_restarts_total", "Total number of worker restarts")?;
+
         registry.register(Box::new(worker_started_total.clone()))?;
         registry.register(Box::new(jobs_running.clone()))?;
         registry.register(Box::new(jobs_created_total.clone()))?;
@@ -89,6 +102,9 @@ impl Metrics {
         registry.register(Box::new(jobs_finished_by_status.clone()))?;
         registry.register(Box::new(worker_status.clone()))?;
         registry.register(Box::new(worker_restarts_total.clone()))?;
+        registry.register(Box::new(worker_pool_desired.clone()))?;
+        registry.register(Box::new(worker_pool_current.clone()))?;
+        registry.register(Box::new(worker_pool_restarts_total.clone()))?;
 
         Ok(Self {
             worker_started_total,
@@ -101,6 +117,9 @@ impl Metrics {
             jobs_finished_by_status,
             worker_status,
             worker_restarts_total,
+            worker_pool_desired,
+            worker_pool_current,
+            worker_pool_restarts_total,
             registry,
         })
     }
