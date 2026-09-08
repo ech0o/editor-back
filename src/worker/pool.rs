@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+const MAX_SCALE_BATCH: usize = 5;
+
 pub struct WorkerPool {
     workers: Arc<Mutex<HashMap<String, WorkerStatus>>>,
     next_worker_id: AtomicUsize,
@@ -116,7 +118,7 @@ impl WorkerPool {
     //     Ok(())
     // }
 
-    pub async fn start_worker(&self) ->anyhow::Result<()> {
+    pub async fn start_worker(&self) -> anyhow::Result<()> {
         let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
 
         let worker_id = format!("worker-{id}");
@@ -172,6 +174,9 @@ impl WorkerPool {
                     if !Self::wait_or_shutdown(backoff, &shutdown).await {
                         Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics)
                             .await;
+
+                        let mut workers = workers.lock().await;
+                        workers.remove(&worker_id);
                         return;
                     }
                     backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
@@ -203,7 +208,16 @@ impl WorkerPool {
                             let mut controls = controls.lock().await;
                             controls.remove(&worker_id);
                         }
-                        Self::set_status(&workers,&worker_id,WorkerStatus::Stopped,&metrics).await;
+                        Self::set_status(
+                            &workers,
+                            &worker_id,
+                            WorkerStatus::Stopped,
+                            &metrics)
+                        .await;
+
+                        let mut workers = workers.lock().await;
+                        workers.remove(&worker_id);
+
                         return;
                     }
                     match result {
@@ -234,32 +248,39 @@ impl WorkerPool {
 
 
                     Self::set_status(&workers, &worker_id, WorkerStatus::Restarting,&metrics).await;
-                    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                   if !Self::wait_or_shutdown(backoff,&shutdown).await{
-                        {
-                            let mut controls = controls.lock().await;
-                            controls.remove(&worker_id);
-                        }
-                        Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics).await;
-                        return;
+                    {
+                        let mut controls = controls.lock().await;
+                        controls.remove(&worker_id);
                     }
                     if uptime >= Duration::from_secs(30) {
                         backoff = INITIAL_BACKOFF;
                     } else {
                         backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                     }
+                    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                   if !Self::wait_or_shutdown(backoff,&shutdown).await{
+
+                        Self::set_status(&workers, &worker_id, WorkerStatus::Stopped, &metrics).await;
+
+                        let mut workers = workers.lock().await;
+                        workers.remove(&worker_id);
+                        return;
+                    }
+
                 }
                 _ = shutdown.cancelled() => {
-                     // {
-                     //        let mut controls = controls.lock().await;
-                     //        controls.remove(&worker_id);
-                     // }
                     tracing::info!(worker_id=%worker_id,"supervisor shutting down worker");
                     worker_shutdown.cancel();
                     let _ = handle.await;
+                     {
+                        let mut controls = controls.lock().await;
+                        controls.remove(&worker_id);
+                     }
                     Self::set_status(&workers, &worker_id, WorkerStatus::Stopped,&metrics).await;
+                    let mut workers = workers.lock().await;
+                    workers.remove(&worker_id);
 
-                    break;
+                    return;
                 }
             }
         }
@@ -316,11 +337,17 @@ impl WorkerPool {
             let controls = self.controls.lock().await;
             controls.get(worker_id).cloned()
         };
-         let Some(control) = control  else {
+        let Some(control) = control else {
             tracing::warn!(worker_id=%worker_id,"worker control not found");
             return;
         };
-        Self::set_status(&self.workers,worker_id,WorkerStatus::Stopping,&self.metrics).await;
+        Self::set_status(
+            &self.workers,
+            worker_id,
+            WorkerStatus::Stopping,
+            &self.metrics,
+        )
+        .await;
         control.shutdown.cancel();
         let handle = {
             let mut supervisors = self.supervisors.lock().await;
@@ -378,17 +405,45 @@ impl WorkerPool {
 
     pub async fn reconcile(&self) {
         let desired = self.desired_size.load(Ordering::Relaxed);
-
         let actual = {
             let supervisors = self.supervisors.lock().await;
             supervisors.len()
         };
+        let status_count = {
+            let workers = self.workers.lock().await;
+
+            let mut counts = HashMap::new();
+            for status in workers.values() {
+                let name = match status {
+                    WorkerStatus::Stopping => "stopping",
+                    WorkerStatus::Stopped => "stopped",
+                    WorkerStatus::Starting => "starting",
+                    WorkerStatus::Restarting => "restarting",
+                    WorkerStatus::Running => "running",
+                };
+                *counts.entry(name).or_insert(0usize) += 1;
+            }
+            counts
+        };
+
+        for status in ["starting",
+            "running",
+            "restarting",
+            "stopping",
+            "stopped",] {
+            let count = status_count.get(status).copied().unwrap_or(0);
+            self.metrics.worker_pool_status.with_label_values(&[status]).set(count as i64);
+        }
         self.metrics.worker_pool_desired.set(desired as i64);
         self.metrics.worker_pool_current.set(actual as i64);
+        self.metrics.worker_pool_reconcile_total.inc();
+        // self.metrics.worker_pool_running.set(running as i64);
         if actual < desired {
-            let count = desired - actual;
+            let count = (desired - actual).min(MAX_SCALE_BATCH);
+            tracing::debug!("reconciling {} workers,scale up", count);
+            self.metrics.worker_pool_scale_up_total.inc_by(count as u64);
             for _ in 0..count {
-                if let Err(e)=self.start_worker().await{
+                if let Err(e) = self.start_worker().await {
                     tracing::error!(
                         error=%e,
                         "failed to start worker"
@@ -396,7 +451,11 @@ impl WorkerPool {
                 }
             }
         } else if actual > desired {
-            let count = actual - desired;
+            let count = (actual - desired).min(MAX_SCALE_BATCH);
+
+            tracing::debug!("reconciling {} workers,scale down", count);
+            self.metrics.worker_pool_scale_down_total.inc_by(count as u64);
+
             let worker_ids = {
                 let workers = self.workers.lock().await;
                 workers
@@ -411,6 +470,11 @@ impl WorkerPool {
                 self.stop_worker(&worker_id).await;
             }
         }
+        let actual = {
+            let supervisors = self.supervisors.lock().await;
+            supervisors.len()
+        };
+        self.metrics.worker_pool_current.set(actual as i64);
     }
 
     pub async fn start_reconciler(self: Arc<Self>) {
