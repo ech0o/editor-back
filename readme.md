@@ -337,7 +337,48 @@ This provides RAII-style resource management for temporary execution files.
 * Kafka
 
 ### Start Infrastructure
+clone server
+[editor-server](https://github.com/ech0o/editor-server)
+```bash
+git clone https://github.com/ech0o/editor-server.git
+```
 
+create table jobs
+
+```sql
+CREATE TABLE jobs (
+                      id UUID PRIMARY KEY,
+                      language TEXT NOT NULL,
+                      code TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      output TEXT,
+                      error TEXT,
+                      exit_code INTEGER,
+                      worker_id TEXT,
+                      locked_at TIMESTAMPTZ,
+                      heartbeat_at TIMESTAMPTZ,
+                      lock_token UUID,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      finished_at TIMESTAMPTZ
+);
+```
+
+create table job_outbox
+```sql
+CREATE TABLE job_outbox (
+                            id UUID PRIMARY KEY,
+                            job_id UUID NOT NULL REFERENCES jobs(id),
+                            event_type TEXT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            published_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_job_outbox_unpublished
+    ON job_outbox (created_at)
+    WHERE published_at IS NULL;
+```
+then
 ```bash
 docker compose up -d
 ```
@@ -349,13 +390,10 @@ PostgreSQL
 Kafka
 Prometheus
 Grafana
+Server
 ```
 
-### Run the API
 
-```bash
-cargo run
-```
 
 ### Run a Worker
 
