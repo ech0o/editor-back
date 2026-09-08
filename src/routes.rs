@@ -136,7 +136,7 @@ pub async fn scale_up(
     State(state): State<Arc<WorkerState>>,
     Json(req): Json<ScaleRequest>,
 ) -> StatusCode {
-    state.worker_pool.scale_up(req.count).await;
+    state.worker_pool.set_size(req.count).await;
     StatusCode::NO_CONTENT
 }
 
@@ -144,7 +144,7 @@ pub async fn scale_down(
     State(state): State<Arc<WorkerState>>,
     Json(req): Json<ScaleRequest>,
 ) -> StatusCode {
-    state.worker_pool.scale_down(req.count).await;
+    state.worker_pool.set_size(req.count).await;
     StatusCode::NO_CONTENT
 }
 
