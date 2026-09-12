@@ -1,0 +1,171 @@
+name: editor-back
+
+services:
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: judge-kafka
+    restart: unless-stopped
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server localhost:9092 || exit 1"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+    # Kafka 只给本机使用，不暴露到公网
+    ports:
+      - "127.0.0.1:9092:9092"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./workspaces:/workspaces
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      DATABASE_URL: "${DATABASE_URL}"
+      WORKSPACE_HOST_ROOT: "${WORKSPACE_HOST_ROOT}"
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    # Worker metrics 只允许 VPS 本机访问
+    ports:
+      - "127.0.0.1:9091:9091"
+
+    stop_grace_period: 30s
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://127.0.0.1:9091/health"
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      DATABASE_URL: "${DATABASE_URL}"
+
+      CLIENT_ID: "${CLIENT_ID}"
+      CLIENT_SECRET: "${CLIENT_SECRET}"
+      REDIRECT_URL: "${REDIRECT_URL}"
+      COOKIE_SECURE: "${COOKIE_SECURE}"
+      REDIRECT_FRONTEND_URL: "${REDIRECT_FRONTEND_URL}"
+      REQWEST_PROXY: "${REQWEST_PROXY}"
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    # 只绑定本机，公网由 Nginx 反向代理
+    ports:
+      - "127.0.0.1:4000:4000"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: judge-prometheus
+    restart: unless-stopped
+
+    user: "0"
+
+    ports:
+      - "127.0.0.1:9090:9090"
+
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - prometheus_data:/prometheus
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:3001:3000"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+
+    depends_on:
+      - prometheus
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kafka_data:
+  prometheus_data:
+  grafana_data:
