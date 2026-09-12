@@ -13,30 +13,6 @@ use crate::db::Database;
 use crate::metrics::Metrics;
 use crate::worker::pool::WorkerPool;
 
-#[derive(Clone)]
-pub struct AppState {
-    // pub runner: DockerRunner,
-    pub semaphore: Arc<Semaphore>,
-    pub jobs: Arc<JobStore>,
-    pub kafka: KafkaProducer,
-    pub metrics:Arc<Metrics>,
-    // pub db:Database
-}
-
-impl AppState {
-    pub fn new(
-        job_store: Arc<JobStore>,
-        kafka_producer: KafkaProducer,
-        metrics: Arc<Metrics>,
-    ) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(4)),
-            jobs: job_store,
-            kafka: kafka_producer,
-            metrics,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct JobState {

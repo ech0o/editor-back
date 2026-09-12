@@ -11,7 +11,7 @@ use crate::state::{JobState, WorkerState};
 use crate::worker::WorkerContext;
 use crate::worker::pool::WorkerPool;
 use crate::workspace::Workspace;
-use crate::{routes, state::AppState};
+use crate::routes;
 use axum::Router;
 use axum::http::{HeaderValue, Method};
 use axum::{
@@ -48,12 +48,8 @@ pub async fn create_app() -> anyhow::Result<()> {
     let kafka = KafkaProducer::new(kafka_addr.as_str())?;
     let jobs = Arc::new(JobStore::new(db));
     let metrics = Arc::new(Metrics::new()?);
-
-    if args.get(1).map(String::as_str) == Some("worker") {
-        run_worker(jobs, kafka, kafka_addr, metrics).await?;
-    } else {
-        run_api(jobs.clone(), kafka.clone(), metrics.clone()).await?;
-    }
+    
+    run_worker(jobs, kafka, kafka_addr, metrics).await?;
     Ok(())
 }
 
@@ -82,12 +78,6 @@ async fn run_worker(
         jobs: jobs.clone(),
     };
 
-    // let consumer = KafkaConsumer::new(
-    //     worker_id.as_str(),
-    //     &kafka_config,
-    //     ctx,
-    //     shutdown.clone(),
-    // )?;
     let pool = Arc::new(WorkerPool::new(kafka_config, ctx, shutdown.clone(),metrics.clone()));
     pool.start(3).await;
     pool.clone().start_reconciler().await;
@@ -110,20 +100,6 @@ async fn run_worker(
     let producer = Arc::new(kafka);
     let reaper = Reaper::new(jobs.clone(), producer.clone());
     tokio::spawn(async move {
-        // let mut interval=tokio::time::interval(tokio::time::Duration::from_secs(10));
-        //  loop{
-        //      interval.tick().await;
-        //      match jobs.reap_stale_job(Duration::from_secs(30)).await{
-        //          Ok(ids)=>{
-        //              for id in ids {
-        //                  tracing::warn!(job_id = %id, "reaped stale job");
-        //              }
-        //          }
-        //          Err(e)=>{
-        //              tracing::error!(err = %e, "failed to reaped stale job");
-        //          }
-        //      }
-        //  }
         let _ = reaper.run().await;
     });
 
@@ -133,39 +109,12 @@ async fn run_worker(
             tracing::error!(err=%err,"outbox_publisher stopped");
         }
     });
-
-    // let consumer_task = tokio::spawn(async move {
-    //     consumer.subscribe()?;
-    //     consumer.run().await
-    // });
+    
     shutdown_signal().await;
     tracing::info!("shutdown signal received");
     shutdown.cancel();
     pool.shutdown().await;
     // consumer_task.await??;
-    Ok(())
-}
-async fn run_api(
-    jobs: Arc<JobStore>,
-    kafka: KafkaProducer,
-    metrics: Arc<Metrics>,
-) -> anyhow::Result<()> {
-    let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>()?)
-        .allow_methods(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers(Any);
-    let router = Router::new()
-        .layer(RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(cors)
-        .merge(routes::router())
-        .with_state(AppState::new(jobs, kafka, metrics));
-    let listener = TcpListener::bind("0.0.0.0:4000").await?;
-    tracing::info!("Listening on http://0.0.0.0:4000");
-
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
     Ok(())
 }
 
