@@ -1,9 +1,6 @@
 use crate::worker::pool::WorkerStatus;
 use prometheus::core::Collector;
-use prometheus::{
-    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, Opts, Registry,
-};
+use prometheus::{Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 pub fn gather() -> String {
     let metric_families = prometheus::gather();
@@ -33,6 +30,13 @@ pub struct Metrics {
     pub worker_pool_desired: IntGauge,
     pub worker_pool_current: IntGauge,
     pub worker_pool_restarts_total: IntCounter,
+
+    pub worker_pool_reconcile_total: IntCounter,
+    pub worker_pool_scale_up_total: IntCounter,
+    pub worker_pool_scale_down_total: IntCounter,
+    pub worker_pool_running:IntGauge,
+    pub worker_pool_status: IntGaugeVec,
+
     pub registry: Registry,
 }
 
@@ -92,6 +96,29 @@ impl Metrics {
         let worker_pool_restarts_total =
             IntCounter::new("worker_pool_restarts_total", "Total number of worker restarts")?;
 
+        let worker_pool_reconcile_total = IntCounter::new(
+            "worker_pool_reconcile_total",
+            "Total number of worker reconciles",
+        )?;
+        let worker_pool_scale_up_total = IntCounter::new(
+            "worker_pool_scale_up_total",
+            "Total number of worker scaling up",
+        )?;
+        let worker_pool_scale_down_total = IntCounter::new(
+            "worker_pool_scale_down_total",
+            "Total number of worker scaling down",
+        )?;
+        let worker_pool_running = IntGauge::new(
+            "worker_running",
+            "Total number of worker running",
+        )?;
+
+        let worker_pool_status = IntGaugeVec::new(
+            Opts::new("worker_pool_status", "Number of workers by status"),
+            &["status"],
+        )?;
+
+
         registry.register(Box::new(worker_started_total.clone()))?;
         registry.register(Box::new(jobs_running.clone()))?;
         registry.register(Box::new(jobs_created_total.clone()))?;
@@ -105,6 +132,11 @@ impl Metrics {
         registry.register(Box::new(worker_pool_desired.clone()))?;
         registry.register(Box::new(worker_pool_current.clone()))?;
         registry.register(Box::new(worker_pool_restarts_total.clone()))?;
+        registry.register(Box::new(worker_pool_reconcile_total.clone()))?;
+        registry.register(Box::new(worker_pool_scale_up_total.clone()))?;
+        registry.register(Box::new(worker_pool_scale_down_total.clone()))?;
+        registry.register(Box::new(worker_pool_running.clone()))?;
+        registry.register(Box::new(worker_pool_status.clone()))?;
 
         Ok(Self {
             worker_started_total,
@@ -120,6 +152,11 @@ impl Metrics {
             worker_pool_desired,
             worker_pool_current,
             worker_pool_restarts_total,
+            worker_pool_reconcile_total,
+            worker_pool_scale_up_total,
+            worker_pool_scale_down_total,
+            worker_pool_running,
+            worker_pool_status,
             registry,
         })
     }
