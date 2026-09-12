@@ -71,7 +71,7 @@ services:
 #    entrypoint: /bin/sh
 #    stdin_open: true
 #    tty: true
-    command: ["worker"]
+#    command: ["worker"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./workspaces:/workspaces
@@ -80,6 +80,7 @@ services:
       KAFKA_BROKERS: "kafka:9092"
       DATABASE_URL: "postgres://postgres:example@db:5432/postgres"
       WORKSPACE_HOST_ROOT: "${PWD}"
+#      WORKER_CRASH_AFTER: "10"
     depends_on:
       kafka:
         condition: service_healthy
@@ -112,6 +113,12 @@ services:
     environment:
       KAFKA_BROKERS: "kafka:9092"
       DATABASE_URL: "postgres://postgres:example@db:5432/postgres"
+      CLIENT_ID: ${CLIENT_ID}
+      CLIENT_SECRET: ${CLIENT_SECRET}
+      REDIRECT_URL: ${REDIRECT_URL}
+      COOKIE_SECURE: ${COOKIE_SECURE}
+      REDIRECT_FRONTEND_URL: ${REDIRECT_FRONTEND_URL}
+      REQWEST_PROXY: ${REQWEST_PROXY}
     depends_on:
       kafka:
         condition: service_healthy
