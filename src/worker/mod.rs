@@ -17,6 +17,7 @@ pub struct Worker {
     pub workspace: Arc<WorkerWorkspace>,
     pub consumer: KafkaConsumer,
     pub shutdown: CancellationToken,
+    crash_after: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -43,11 +44,17 @@ impl Worker {
             shutdown.clone(),
             Arc::clone(&workspace),
         )?;
+
+        let crash_after = std::env::var("WORKER_CRASH_AFTER")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
         Ok(Self {
             worker_id,
             workspace,
             consumer,
             shutdown,
+            crash_after
         })
     }
 
@@ -57,6 +64,15 @@ impl Worker {
             pid = std::process::id(),
             "worker started"
         );
+        // if let Some(duration) = self.crash_after{
+        //     tokio::time::sleep(duration).await;
+        //     tracing::error!(
+        //         worker_id = %self.worker_id,
+        //         ?duration,
+        //         "injecting worker failure"
+        //     );
+        //     return Err(anyhow::anyhow!("injecting worker failure"))
+        // }
         self.consumer.subscribe()?;
         self.consumer.run().await?;
 
