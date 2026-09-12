@@ -156,3 +156,8 @@ pub struct DlqMessage{
 pub struct ScaleRequest{
     pub count: usize,
 }
+#[derive(Debug,Serialize,Deserialize)]
+pub struct ScaleResponse{
+    pub msg: String,
+}
+
